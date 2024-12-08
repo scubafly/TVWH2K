@@ -2,10 +2,19 @@
 ## A Simple application written in golang that handles webhook from tradingview and sends the data to kraken using the kraken api
 
 ## TODO
-- [ ] Create authenitcation
+- [ ] Create authenitcation for webhook
+- [ ] Fire order to kraken after webhook call
 - [ ] Make connection to kraken
-- [ ] Create envoirment variable to store keys
+- [ ] Make option to test the connection instead of placing an order
+- [ ] Create envoirment variable to store keys, and add to gitignore
+- [ ] Read envorment variable
 - [ ] Put it in a deployable docker container
+- [ ] Create something that creates an order with stop loss and take profit
+- [ ] SH .env file example
+- [ ] SH (Should have): Unit tests
+- [ ] NTH (NTH): Create trailing stop loss order
+- [ ] NTH Create option to change settings like api key, leverage etc. for now in the .env file would be ok
+
 
 ## How to run / develop localy
 - `go build && go run .`
