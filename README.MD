@@ -1,4 +1,4 @@
-# TVWH2K
+# TradingView WebHook 2 Kraken
 ## A Simple application written in golang that handles webhook from tradingview and sends the data to kraken using the kraken api
 
 ## TODO
