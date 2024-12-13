@@ -1,9 +1,8 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"net/http"
 )
 
@@ -12,15 +11,24 @@ type WebhookHandler struct {
 }
 
 func NewWebhookHandler() *WebhookHandler {
-	// This function should return a new WebhookHandler object
 	return &WebhookHandler{}
 }
 
 func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	b, err := io.ReadAll(r.Body)
+	var requestBody map[string]string
+	err := json.NewDecoder(r.Body).Decode(&requestBody)
 	if err != nil {
-		log.Fatal(err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
-	fmt.Println("Data is: ", string(b))
+	token, ok := requestBody["token"]
+	if !ok || token != "todoSecret" {
+		fmt.Println("Invalid token", string(token))
+		return
+	}
+
+	fmt.Println("ok: ", ok)
+	fmt.Println("Token is: ", string(requestBody["token"]))
+	fmt.Println("Data is: ", string(requestBody["text"]))
 }
