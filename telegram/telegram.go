@@ -27,6 +27,7 @@ func sendMessage(text string, chatId int32) (string, error) {
 		"chat_id": {strconv.FormatInt(chatId, 10)},
 	}
 
+	// @TODO remove printf debug lines
 	fmt.Printf("URL: %s\n", apiUrl)
 	fmt.Printf("Data: %v\n", message)
 
