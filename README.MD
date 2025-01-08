@@ -28,4 +28,4 @@ You should see the text in your logs.
 
 ## Docker
 - `docker build . -t tvwh2k:latest`
-- `docker run tvwh2k:latest`
+- `docker run -p9000:8081 tvwh2k:latest`

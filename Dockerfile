@@ -6,4 +6,6 @@ COPY . .
 
 RUN go build -o bin .
 
+EXPOSE 8081
+
 ENTRYPOINT [ "/app/bin" ]
