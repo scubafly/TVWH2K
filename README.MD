@@ -2,6 +2,7 @@
 ## A Simple application written in golang that handles webhook from tradingview and sends the data to kraken using the kraken api
 
 ## TODO
+- [ ] Don't put .env in docker image, inject into the container instead!
 - [ ] Output signal to telegram
 - [ ] Create authenitcation for webhook
 - [ ] Fire order to kraken after webhook call
@@ -22,5 +23,9 @@
 
 ## How to run / develop localy
 - `go build && go run .`
-- In your terminal: `curl -X POST http://localhost:8081/webhooks -H 'Content-Type: application/json' -d '{"text": "your webhook data here"}`
+- In your terminal: `curl -X POST http://localhost:8081/webhooks -H 'Content-Type: application/json' -d '{"text": "your webhook data here", "token": "yourtoken"}`
 You should see the text in your logs.
+
+## Docker
+- `docker build . -t tvwh2k:latest`
+- `docker run -p9000:8081 tvwh2k:latest`
