@@ -9,12 +9,13 @@
 - [ ] Make connection to kraken
 - [ ] Make option to test the connection instead of placing an order
 - [ ] Create something that creates an order with stop loss and take profit
-- [ ] SH .env file example
+
 - [ ] SH (Should have): Unit tests
 - [ ] NTH (NTH): Create trailing stop loss order
 - [ ] NTH Create option to change settings like api key, leverage etc. for now in the .env file would be ok
 
 ## Done
+- [x] SH .env file example
 - [x] Put it in a deployable docker container
 - [x] Make telegram connection
 - [x] Create envoirment variable to store keys, and add to gitignore
