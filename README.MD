@@ -23,7 +23,7 @@
 
 ## How to run / develop localy
 - `go build && go run .`
-- In your terminal: `curl -X POST http://localhost:8081/webhooks -H 'Content-Type: application/json' -d '{"text": "your webhook data here"}`
+- In your terminal: `curl -X POST http://localhost:8081/webhooks -H 'Content-Type: application/json' -d '{"text": "your webhook data here", "token": "yourtoken"}`
 You should see the text in your logs.
 
 ## Docker
