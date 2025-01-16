@@ -13,16 +13,16 @@
 - [ ] NTH Create option to change settings like api key, leverage etc. for now in the .env file would be ok
 
 ## Done
-- [x] Create ~~authenitcation~~ token validation for webhook
+- [x] Create ~~authentication~~ token validation for webhook
 - [x] Don't put .env in docker image, inject into the container instead!
 - [x] SH .env file example
 - [x] Put it in a deployable docker container
 - [x] Make telegram connection
-- [x] Create envoirment variable to store keys, and add to gitignore
-- [x] Read envorment variable
+- [x] Create environment variable to store keys, and add to gitignore
+- [x] Read environment variable
 
 
-## How to run / develop localy
+## How to run / develop locally
 - `go build && go run .` or if you have air installed just `air`
 - In your terminal: `curl -X POST http://localhost:8081/webhooks -H 'Content-Type: application/json' -d '{"text": "your webhook data here", "token": "yourtoken"}`
 You should see the text in your logs.
