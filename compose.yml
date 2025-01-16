@@ -1,0 +1,14 @@
+x-shared: &shared
+  DEBUG_MODE: ${DEBUG_MODE}
+  TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+  TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+  TOKEN: ${TOKEN}
+
+services:
+  tvwh2k:
+    container_name: tvwh2k
+    image: scubafly/tvwh2k:latest
+    environment:
+      <<: *shared
+    ports:
+     - "9000:8081"

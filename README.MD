@@ -28,5 +28,6 @@
 You should see the text in your logs.
 
 ## Docker
-- `docker build . -t tvwh2k:latest`
-- `docker run -p9000:8081 tvwh2k:latest`
+- `docker build . -t scubafly/tvwh2k:latest`
+- `docker run -p9000:8081 scubafly/tvwh2k:latest -e TELEGRAM_BOT_TOKEN=token -e TELEGRAM_CHAT_ID=12345 -e TOKEN=abc`
+- `docker compose up --build` when the .env file is used.

@@ -9,16 +9,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
-
-	"github.com/joho/godotenv"
 )
 
 func sendMessage(text string, chatId int32) (string, error) {
 
-	err := godotenv.Load("../.env")
-	if err != nil {
-		log.Fatalf("Error loading .env file")
-	}
 	log.Printf("Sending message: %s, to chat id %d", text, chatId)
 	var apiUrl string = "https://api.telegram.org/bot" + os.Getenv("TELEGRAM_BOT_TOKEN") + "/sendMessage"
 

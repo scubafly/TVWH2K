@@ -3,11 +3,8 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
-
-	"github.com/joho/godotenv"
 )
 
 type WebhookHandler struct {
@@ -19,13 +16,9 @@ func NewWebhookHandler() *WebhookHandler {
 }
 
 func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	err := godotenv.Load(".env")
-	if err != nil {
-		log.Fatalf("Error loading .env file")
-	}
 	var requestBody map[string]string
 
-	err = json.NewDecoder(r.Body).Decode(&requestBody)
+	err := json.NewDecoder(r.Body).Decode(&requestBody)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -34,6 +27,9 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	token, ok := requestBody["token"]
 	if !ok || token != os.Getenv("TOKEN") {
 		fmt.Println("Invalid token", string(token))
+		if os.Getenv("DEBUG_MODE") {
+			fmt.Println("Expected", os.Getenv("TOKEN"))
+		}
 		return
 	}
 

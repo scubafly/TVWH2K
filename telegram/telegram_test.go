@@ -6,8 +6,6 @@ import (
 	"os"
 	"strconv"
 	"testing"
-
-	"github.com/joho/godotenv"
 )
 
 type Response struct {
@@ -33,10 +31,6 @@ type Response struct {
 }
 
 func TestSendMessage(t *testing.T) {
-	err := godotenv.Load("../.env")
-	if err != nil {
-		log.Fatalf("Error loading .env file")
-	}
 
 	text := "Runing unit test"
 	chat_id, err := strconv.Atoi(os.Getenv("TELEGRAM_CHAT_ID"))
