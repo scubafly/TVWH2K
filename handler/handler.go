@@ -27,7 +27,7 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	token, ok := requestBody["token"]
 	if !ok || token != os.Getenv("TOKEN") {
 		fmt.Println("Invalid token", string(token))
-		if os.Getenv("DEBUG_MODE") {
+		if os.Getenv("DEBUG_MODE") == "true" {
 			fmt.Println("Expected", os.Getenv("TOKEN"))
 		}
 		return
