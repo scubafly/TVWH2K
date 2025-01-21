@@ -11,4 +11,4 @@ services:
     environment:
       <<: *shared
     ports:
-     - "9999:8081"
+     - "8081:8081"
