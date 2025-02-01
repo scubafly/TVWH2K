@@ -29,5 +29,8 @@ You should see the text in your logs.
 
 ## Docker
 - `docker build . -t scubafly/tvwh2k:latest`
-- `docker run -p9000:8081 scubafly/tvwh2k:latest -e TELEGRAM_BOT_TOKEN=token -e TELEGRAM_CHAT_ID=12345 -e TOKEN=abc`
+- `docker run -p9000:8081 -e TELEGRAM_BOT_TOKEN=token -e TELEGRAM_CHAT_ID=12345 -e TOKEN=abc scubafly/tvwh2k:latest`
 - `docker compose up --build` when the .env file is used.
+
+### To build for arm64 to run on linux you can use buildx
+`docker buildx build --platform linux/amd64 -t scubafly/tvwh2k:latest`
