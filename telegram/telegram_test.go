@@ -38,7 +38,7 @@ func TestSendMessage(t *testing.T) {
 		t.Errorf("error converting sting to int", err.Error())
 	}
 
-	resp, err := sendMessage(text, chat_id))
+	resp, err := SendMessage(text, chat_id))
 	if err != nil {
 		t.Errorf("Error sending message to Telegram, got %s", err.Error())
 	}
