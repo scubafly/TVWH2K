@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-func sendMessage(text string, chatId int32) (string, error) {
+func SendMessage(text string, chatId int64) (string, error) {
 
 	log.Printf("Sending message: %s, to chat id %d", text, chatId)
 	var apiUrl string = "https://api.telegram.org/bot" + os.Getenv("TELEGRAM_BOT_TOKEN") + "/sendMessage"
