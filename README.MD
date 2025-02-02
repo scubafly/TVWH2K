@@ -2,9 +2,9 @@
 ## A Simple application written in golang that handles webhook from tradingview and sends the data to kraken using the kraken api
 
 ## TODO
-- [ ] Output signal to telegram
-- [ ] Fire order to kraken after webhook call
+- [ ] Instead of only "text" and "token" as json variables, also let tradingview send "direction", "coin", "leverage" and other paramters
 - [ ] Make connection to kraken
+- [ ] Fire order to kraken after webhook call
 - [ ] Make option to test the connection instead of placing an order
 - [ ] Create something that creates an order with stop loss and take profit
 
@@ -13,6 +13,7 @@
 - [ ] NTH Create option to change settings like api key, leverage etc. for now in the .env file would be ok
 
 ## Done
+- [x] Output signal to telegram
 - [x] Create ~~authentication~~ token validation for webhook
 - [x] Don't put .env in docker image, inject into the container instead!
 - [x] SH .env file example
