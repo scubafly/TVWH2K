@@ -4,28 +4,41 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"tvwh2k/database"
 	"tvwh2k/handler"
+	"tvwh2k/kraken"
 )
 
 func main() {
-	h := handler.NewWebhookHandler()
-	// k := kraken.NewClient()
+	apiKey := os.Getenv("KRAKEN_API_KEY")
+	apiSecret := os.Getenv("KRAKEN_API_SECRET")
+
+	var k *kraken.Kraken
+	var err error
+
+	if apiKey == "" || apiSecret == "" {
+		fmt.Println("Warning: KRAKEN_API_KEY or KRAKEN_API_SECRET not set. Kraken integration disabled.")
+	} else {
+		k, err = kraken.NewClient(apiKey, apiSecret)
+		if err != nil {
+			log.Fatalf("Failed to create Kraken client: %v", err)
+		}
+		fmt.Println("Kraken client initialized.")
+	}
+
+	// Initialize Database
+	db, err := database.InitDB("./tvwh2k.db")
+	if err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+
+	h := handler.NewWebhookHandler(k, db)
 	http.HandleFunc("/webhooks", h.ServeHTTP)
+	http.HandleFunc("/api/signals", h.HandleGetSignals)
+	http.HandleFunc("/api/trades", h.HandleGetTrades)
 
-	// order := kraken.Order{
-	// 	Nonce:     3,
-	// 	OrderType: "buy",
-	// 	Type:      "limit",
-	// 	Volume:    "0.5",
-	// 	Pair:      "BTCUSDT",
-	// 	Price:     "90000",
-	// 	ClOrdID:   "123456789",
-	// 	Test:      true,
-	// }
-
-	// k.AddOrder(order)
-
-	fmt.Println("Starting server...")
+	fmt.Println("Starting server on :8081...")
 	if err := http.ListenAndServe(":8081", nil); err != nil {
 		log.Fatal(err)
 	}

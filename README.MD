@@ -1,36 +1,61 @@
 # TVWH2K
 ## A Simple application written in golang that handles webhook from tradingview and sends the data to kraken using the kraken api
 
-## TODO
-- [ ] Output signal to telegram
-- [ ] Fire order to kraken after webhook call
-- [ ] Make connection to kraken
-- [ ] Make option to test the connection instead of placing an order
-- [ ] Create something that creates an order with stop loss and take profit
+## Status
+**MVP Implemented**
+- [x] Output signal to telegram
+- [x] Fire order to kraken after webhook call
+- [x] Make connection to kraken
+- [x] Make option to test the connection instead of placing an order (via `KRAKEN_TEST_MODE`)
+- [x] Create something that calls AddOrder (Supports `ordertype`, `price`, `price2` for stop loss/take profit)
 
-- [ ] SH (Should have): Unit tests
-- [ ] NTH (NTH): Create trailing stop loss order
-- [ ] NTH Create option to change settings like api key, leverage etc. for now in the .env file would be ok
+## Configuration
+Create a `.env` file based on `.env.example`:
+```env
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+TOKEN=your-webhook-secret
+KRAKEN_API_KEY=...
+KRAKEN_API_SECRET=...
+KRAKEN_TEST_MODE=true  # Set to false to execute real orders
+```
 
-## Done
-- [x] Create ~~authentication~~ token validation for webhook
-- [x] Don't put .env in docker image, inject into the container instead!
-- [x] SH .env file example
-- [x] Put it in a deployable docker container
-- [x] Make telegram connection
-- [x] Create environment variable to store keys, and add to gitignore
-- [x] Read environment variable
+## Usage
+The application expects a JSON payload at `POST /webhooks`.
 
+### Payload Format
+```json
+{
+  "token": "your-webhook-secret",
+  "text": "BUY Signal on BTCUSDT",
+  "pair": "XBT/USD",
+  "type": "buy",
+  "ordertype": "limit",
+  "volume": "0.001",
+  "price": "95000",
+  "close_ordertype": "stop-loss-limit",
+  "close_price": "90000",
+  "close_price2": "89500"
+}
+```
 
-## How to run / develop locally
-- `go build && go run .` or if you have air installed just `air`
-- In your terminal: `curl -X POST http://localhost:8081/webhooks -H 'Content-Type: application/json' -d '{"text": "your webhook data here", "token": "yourtoken"}`
-You should see the text in your logs.
+### Supported Fields
+- `token`: Must match `TOKEN` env var.
+- `text`: Message sent to Telegram.
+- `pair`: Kraken asset pair (e.g. `XBT/USD`).
+- `type`: `buy` or `sell`.
+- `ordertype`: `market`, `limit`, `stop-loss`, etc.
+- `volume`: Amount to trade.
+- `price`: Limit price or stop price.
+- `price2`: Secondary price (optional).
+
+## API
+ The application exposes two read-only endpoints for external dashboards:
+- `GET /api/signals`: Returns the last 50 received webhook signals.
+- `GET /api/trades`: Returns the last 50 executed trades with their status and PnL.
 
 ## Docker
-- `docker build . -t scubafly/tvwh2k:latest`
-- `docker run -p9000:8081 -e TELEGRAM_BOT_TOKEN=token -e TELEGRAM_CHAT_ID=12345 -e TOKEN=abc scubafly/tvwh2k:latest`
-- `docker compose up --build` when the .env file is used.
+- `docker compose up --build`
 
-### To build for arm64 to run on linux you can use buildx
-`docker buildx build --platform linux/amd64 -t scubafly/tvwh2k:latest`
+## Local Development
+- `go build && go run .`

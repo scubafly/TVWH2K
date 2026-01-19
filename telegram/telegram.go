@@ -41,6 +41,7 @@ func SendMessage(text string, chatId int64) (string, error) {
 	// TODO create timout.
 	resp, err := client.Do(req)
 	if err != nil {
+		log.Printf("Error client do: %s", err)
 		return "", err
 	}
 	defer resp.Body.Close()

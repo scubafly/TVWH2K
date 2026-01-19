@@ -1,12 +1,16 @@
 x-shared: &shared
-  DEBUG_MODE: ${DEBUG_MODE}
-  TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-  TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
-  TOKEN: ${TOKEN}
+  DEBUG_MODE: "${DEBUG_MODE}"
+  TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+  TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID}"
+  TOKEN: "${TOKEN}"
+  KRAKEN_API_KEY: "${KRAKEN_API_KEY}"
+  KRAKEN_API_SECRET: "${KRAKEN_API_SECRET}"
+  KRAKEN_TEST_MODE: "${KRAKEN_TEST_MODE}"
 
 services:
   tvwh2k:
     container_name: tvwh2k
+    build: .
     image: scubafly/tvwh2k:latest
     environment:
       <<: *shared
