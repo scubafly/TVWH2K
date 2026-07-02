@@ -5,41 +5,79 @@ import (
 	"log"
 	"net/http"
 	"os"
+
+	"tvwh2k/auth"
 	"tvwh2k/database"
 	"tvwh2k/handler"
-	"tvwh2k/kraken"
+	"tvwh2k/security"
 )
 
 func main() {
-	apiKey := os.Getenv("KRAKEN_API_KEY")
-	apiSecret := os.Getenv("KRAKEN_API_SECRET")
-
-	var k *kraken.Kraken
-	var err error
-
-	if apiKey == "" || apiSecret == "" {
-		fmt.Println("Warning: KRAKEN_API_KEY or KRAKEN_API_SECRET not set. Kraken integration disabled.")
-	} else {
-		k, err = kraken.NewClient(apiKey, apiSecret)
-		if err != nil {
-			log.Fatalf("Failed to create Kraken client: %v", err)
-		}
-		fmt.Println("Kraken client initialized.")
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		log.Fatal("DATABASE_URL not set (postgres connection string to your Supabase project)")
 	}
-
-	// Initialize Database
-	db, err := database.InitDB("./tvwh2k.db")
+	db, err := database.InitDB(dbURL)
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
+	fmt.Println("Connected to database.")
 
-	h := handler.NewWebhookHandler(k, db)
-	http.HandleFunc("/webhooks", h.ServeHTTP)
-	http.HandleFunc("/api/signals", h.HandleGetSignals)
-	http.HandleFunc("/api/trades", h.HandleGetTrades)
+	encryptor, err := security.NewEncryptorFromEnv()
+	if err != nil {
+		log.Fatalf("Failed to initialize encryption: %v", err)
+	}
 
-	fmt.Println("Starting server on :8081...")
-	if err := http.ListenAndServe(":8081", nil); err != nil {
+	verifier, err := auth.NewVerifierFromEnv()
+	if err != nil {
+		log.Fatalf("Failed to initialize auth verifier: %v", err)
+	}
+
+	apiBaseURL := os.Getenv("API_BASE_URL")
+	if apiBaseURL == "" {
+		log.Fatal("API_BASE_URL not set (public base URL of this service, used to build webhook URLs)")
+	}
+
+	webhookHandler := handler.NewWebhookHandler(db, encryptor)
+	connectionsHandler := handler.NewConnectionsHandler(db, encryptor, apiBaseURL)
+
+	mux := http.NewServeMux()
+
+	// Public: TradingView calls this directly, the per-connection token is the auth.
+	mux.HandleFunc("POST /webhooks/{token}", webhookHandler.ServeHTTP)
+
+	// Authenticated (Supabase JWT) endpoints for the frontend.
+	mux.HandleFunc("POST /api/connections", verifier.Middleware(connectionsHandler.Create))
+	mux.HandleFunc("GET /api/connections", verifier.Middleware(connectionsHandler.List))
+	mux.HandleFunc("POST /api/connections/{id}/test", verifier.Middleware(connectionsHandler.Test))
+	mux.HandleFunc("GET /api/signals", verifier.Middleware(webhookHandler.HandleGetSignals))
+	mux.HandleFunc("GET /api/trades", verifier.Middleware(webhookHandler.HandleGetTrades))
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8081"
+	}
+	fmt.Printf("Starting server on :%s...\n", port)
+	if err := http.ListenAndServe(":"+port, withCORS(mux)); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// withCORS allows the frontend (a different origin, e.g. tradingbridge.online
+// calling api.tradingbridge.online) to call the /api/* routes with a bearer
+// token. /webhooks/* doesn't need this -- TradingView calls it server-to-server.
+func withCORS(next http.Handler) http.Handler {
+	frontendOrigin := os.Getenv("FRONTEND_ORIGIN")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if frontendOrigin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", frontendOrigin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

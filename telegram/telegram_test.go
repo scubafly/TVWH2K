@@ -2,7 +2,6 @@ package telegram
 
 import (
 	"encoding/json"
-	"log"
 	"os"
 	"strconv"
 	"testing"
@@ -30,27 +29,31 @@ type Response struct {
 	} `json:"result"`
 }
 
+// TestSendMessage hits the real Telegram API, so it only runs when
+// TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are set in the environment.
 func TestSendMessage(t *testing.T) {
-
-	text := "Runing unit test"
-	chat_id, err := strconv.Atoi(os.Getenv("TELEGRAM_CHAT_ID"))
-	if err != nil {
-		t.Errorf("error converting sting to int", err.Error())
+	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	chatIDStr := os.Getenv("TELEGRAM_CHAT_ID")
+	if botToken == "" || chatIDStr == "" {
+		t.Skip("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set, skipping live Telegram test")
 	}
 
-	resp, err := SendMessage(text, chat_id))
+	chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
 	if err != nil {
-		t.Errorf("Error sending message to Telegram, got %s", err.Error())
+		t.Fatalf("error converting TELEGRAM_CHAT_ID to int: %s", err.Error())
+	}
+
+	text := "Running unit test"
+	resp, err := SendMessage(botToken, text, chatID)
+	if err != nil {
+		t.Fatalf("Error sending message to Telegram, got %s", err.Error())
 	}
 
 	var respData Response
-	err = json.Unmarshal([]byte(resp), &respData)
-	if err != nil {
-		t.Errorf("Error unmarshalling response from Telegram, got %s", err.Error())
+	if err := json.Unmarshal([]byte(resp), &respData); err != nil {
+		t.Fatalf("Error unmarshalling response from Telegram, got %s", err.Error())
 	}
-	// check := strings.Split(resp, "")[4]
 	if text != respData.Result.Text {
 		t.Errorf("Expected response to be %s, got %s", text, respData.Result.Text)
 	}
-
 }
