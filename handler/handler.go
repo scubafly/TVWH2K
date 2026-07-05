@@ -1,11 +1,14 @@
 package handler
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strconv"
+	"sync"
 
 	"tvwh2k/database"
 	"tvwh2k/kraken"
@@ -25,23 +28,35 @@ type WebhookHandler struct {
 	db        *database.DB
 	encryptor *security.Encryptor
 	jobs      chan signalJob
+	wg        sync.WaitGroup
+	testMode  bool // global kill-switch: when true, all Kraken orders are validate-only
 }
 
 type signalJob struct {
 	Connection *database.Connection
 	Request    WebhookRequest
+	SignalID   int64
 }
 
-func NewWebhookHandler(db *database.DB, encryptor *security.Encryptor) *WebhookHandler {
+func NewWebhookHandler(db *database.DB, encryptor *security.Encryptor, testMode bool) *WebhookHandler {
 	h := &WebhookHandler{
 		db:        db,
 		encryptor: encryptor,
 		jobs:      make(chan signalJob, jobQueueSize),
+		testMode:  testMode,
 	}
+	h.wg.Add(workerCount)
 	for i := 0; i < workerCount; i++ {
 		go h.worker()
 	}
 	return h
+}
+
+// Close stops accepting new jobs and waits for in-flight signals to finish.
+// Call after the HTTP server has shut down.
+func (h *WebhookHandler) Close() {
+	close(h.jobs)
+	h.wg.Wait()
 }
 
 type WebhookRequest struct {
@@ -69,20 +84,34 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := h.db.GetConnectionByWebhookToken(token)
-	if err != nil {
-		http.Error(w, "Unknown webhook token", http.StatusUnauthorized)
-		return
-	}
-
 	var req WebhookRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
+	conn, err := h.db.GetConnectionByWebhookToken(token)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "Unknown webhook token", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		log.Printf("Failed to look up webhook token: %v", err)
+		http.Error(w, "Temporary server error, retry later", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Persist the signal before acknowledging: once TradingView gets a 2xx it
+	// never retries, so an in-memory-only signal would be lost on restart.
+	signalID, err := h.db.SaveSignal(conn.ID, req.Pair, req.Type, req)
+	if err != nil {
+		log.Printf("Failed to save signal for connection %d: %v", conn.ID, err)
+		http.Error(w, "Temporary server error, retry later", http.StatusServiceUnavailable)
+		return
+	}
+
 	select {
-	case h.jobs <- signalJob{Connection: conn, Request: req}:
+	case h.jobs <- signalJob{Connection: conn, Request: req, SignalID: signalID}:
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		w.Write([]byte(`{"status":"accepted"}`))
@@ -93,21 +122,28 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *WebhookHandler) worker() {
+	defer h.wg.Done()
 	for job := range h.jobs {
-		h.processSignal(job.Connection, job.Request)
+		h.safeProcess(job)
 	}
+}
+
+// safeProcess isolates a panic in one signal's processing so it can't take
+// down the whole multi-tenant process.
+func (h *WebhookHandler) safeProcess(job signalJob) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("Panic processing signal %d for connection %d: %v", job.SignalID, job.Connection.ID, rec)
+		}
+	}()
+	h.processSignal(job.Connection, job.Request, job.SignalID)
 }
 
 // processSignal runs off the hot request path: saves the signal, notifies
 // Telegram (if configured for this connection), places the Kraken order
 // (or dry-runs it in test mode), and records the resulting trade.
-func (h *WebhookHandler) processSignal(conn *database.Connection, req WebhookRequest) {
-	fmt.Printf("Processing signal for connection %d: %s %s\n", conn.ID, req.Type, req.Pair)
-
-	signalID, err := h.db.SaveSignal(conn.ID, req.Pair, req.Type, req)
-	if err != nil {
-		log.Printf("Failed to save signal for connection %d: %v", conn.ID, err)
-	}
+func (h *WebhookHandler) processSignal(conn *database.Connection, req WebhookRequest, signalID int64) {
+	log.Printf("Processing signal %d for connection %d: %s %s", signalID, conn.ID, req.Type, req.Pair)
 
 	notify := func(msg string) {
 		if !conn.TelegramChatID.Valid || len(conn.TelegramBotTokenEncrypted) == 0 {
@@ -175,7 +211,8 @@ func (h *WebhookHandler) processSignal(conn *database.Connection, req WebhookReq
 		orderInput.Close = closeParams
 	}
 
-	if conn.TestMode {
+	testMode := h.testMode || conn.TestMode
+	if testMode {
 		orderInput.Validate = true
 	}
 
@@ -183,11 +220,17 @@ func (h *WebhookHandler) processSignal(conn *database.Connection, req WebhookReq
 
 	var resultMsg string
 	var txid string
+	var status string
 
 	if err != nil {
+		status = "failed"
 		resultMsg = fmt.Sprintf("❌ Order Failed: %v", err)
 		log.Println(resultMsg)
 	} else {
+		status = "executed"
+		if testMode {
+			status = "validated"
+		}
 		resultMsg = fmt.Sprintf("✅ Order Placed: %s", resp.Description.Order)
 		if len(resp.TxID) > 0 {
 			txid = resp.TxID[0]
@@ -198,10 +241,8 @@ func (h *WebhookHandler) processSignal(conn *database.Connection, req WebhookReq
 		}
 	}
 
-	if signalID != 0 && txid != "" {
-		if err := h.db.SaveTrade(signalID, conn.ID, req.Pair, req.Type, req.OrderType, req.Volume, req.Price, txid); err != nil {
-			log.Printf("Failed to save trade for connection %d: %v", conn.ID, err)
-		}
+	if err := h.db.SaveTrade(signalID, conn.ID, req.Pair, req.Type, req.OrderType, req.Volume, req.Price, txid, status); err != nil {
+		log.Printf("Failed to save trade for connection %d: %v", conn.ID, err)
 	}
 
 	notify(resultMsg)
@@ -216,8 +257,7 @@ func (h *WebhookHandler) HandleGetSignals(w http.ResponseWriter, r *http.Request
 			http.Error(w, fmt.Sprintf("Failed to fetch signals: %v", err), http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(signals)
+		writeJSON(w, http.StatusOK, signals)
 	})
 }
 
@@ -230,8 +270,7 @@ func (h *WebhookHandler) HandleGetTrades(w http.ResponseWriter, r *http.Request)
 			http.Error(w, fmt.Sprintf("Failed to fetch trades: %v", err), http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(trades)
+		writeJSON(w, http.StatusOK, trades)
 	})
 }
 

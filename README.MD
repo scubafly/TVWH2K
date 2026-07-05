@@ -27,6 +27,8 @@ SUPABASE_JWT_SECRET=your-supabase-jwt-secret
 ENCRYPTION_KEY=replace-with-openssl-rand--base64-32-output
 API_BASE_URL=https://api.tradingbridge.online
 FRONTEND_ORIGIN=https://tradingbridge.online
+# Anything other than "false" keeps all Kraken orders validate-only (dry-run).
+KRAKEN_TEST_MODE=true
 PORT=8081
 ```
 
@@ -49,11 +51,15 @@ PORT=8081
 ```
 
 ### Authenticated (`Authorization: Bearer <supabase JWT>`)
-- `POST /api/connections` — body `{kraken_api_key, kraken_api_secret}`; tests the credentials live, stores them encrypted, returns `{id, webhook_url, test_mode, status, created_at}`.
-- `GET /api/connections` — list your connection(s): `[{id, webhook_url, test_mode, created_at}]` (no live Kraken check, to avoid rate-limiting — use the endpoint below for that).
+- `POST /api/connections` — body `{kraken_api_key, kraken_api_secret}` plus optional `{telegram_bot_token, telegram_chat_id}`; tests the credentials live, stores them encrypted, returns `{id, webhook_url, test_mode, telegram_enabled, status, created_at}`.
+- `GET /api/connections` — list your connection(s): `[{id, webhook_url, test_mode, telegram_enabled, created_at}]` (no live Kraken check, to avoid rate-limiting — use the endpoint below for that).
+- `PATCH /api/connections/{id}` — update Telegram notification settings: `{telegram_bot_token, telegram_chat_id}` (omit a field to leave it unchanged; empty string / 0 clears it).
 - `POST /api/connections/{id}/test` — on-demand live credential check: `{status: "ok"|"invalid_credentials"}`.
 - `GET /api/signals?connection_id=` — last 50 signals for that connection.
-- `GET /api/trades?connection_id=` — last 50 executed trades for that connection.
+- `GET /api/trades?connection_id=` — last 50 trades for that connection; `status` is `executed`, `validated` (test mode dry-run) or `failed`.
+
+## Test mode / going live
+All orders are sent to Kraken with the `validate` flag (dry-run) unless the server is started with `KRAKEN_TEST_MODE=false`. This is a server-wide kill-switch; the per-connection `test_mode` column also forces dry-run when set.
 
 ## Docker
 - `docker compose up --build`

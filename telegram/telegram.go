@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -37,8 +38,11 @@ func SendMessage(botToken, text string, chatId int64) (string, error) {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		log.Printf("Error sending Telegram message: %s", err)
-		return "", err
+		// Transport errors embed the full request URL, which contains the bot
+		// token -- redact it before the error reaches any log.
+		redacted := errors.New(strings.ReplaceAll(err.Error(), botToken, "[redacted]"))
+		log.Printf("Error sending Telegram message: %s", redacted)
+		return "", redacted
 	}
 	defer resp.Body.Close()
 
