@@ -24,12 +24,19 @@ const (
 // WebhookHandler receives TradingView alerts (one per connection, identified
 // by the token in the URL) and processes them asynchronously so the webhook
 // response isn't held open by Kraken/Telegram network latency.
+// orderPlacer is the slice of the Kraken client processSignal needs; tests
+// substitute a fake via WebhookHandler.newKraken.
+type orderPlacer interface {
+	AddOrder(order kraken.OrderInput) (*kraken.AddOrderResponse, error)
+}
+
 type WebhookHandler struct {
 	db        *database.DB
 	encryptor *security.Encryptor
 	jobs      chan signalJob
 	wg        sync.WaitGroup
 	testMode  bool // global kill-switch: when true, all Kraken orders are validate-only
+	newKraken func(apiKey, apiSecret string) (orderPlacer, error)
 }
 
 type signalJob struct {
@@ -44,6 +51,9 @@ func NewWebhookHandler(db *database.DB, encryptor *security.Encryptor, testMode 
 		encryptor: encryptor,
 		jobs:      make(chan signalJob, jobQueueSize),
 		testMode:  testMode,
+		newKraken: func(apiKey, apiSecret string) (orderPlacer, error) {
+			return kraken.NewClient(apiKey, apiSecret)
+		},
 	}
 	h.wg.Add(workerCount)
 	for i := 0; i < workerCount; i++ {
@@ -180,7 +190,7 @@ func (h *WebhookHandler) processSignal(conn *database.Connection, req WebhookReq
 		return
 	}
 
-	krakenClient, err := kraken.NewClient(apiKey, apiSecret)
+	krakenClient, err := h.newKraken(apiKey, apiSecret)
 	if err != nil {
 		log.Printf("Failed to build Kraken client for connection %d: %v", conn.ID, err)
 		return

@@ -22,10 +22,11 @@ type ConnectionsHandler struct {
 	encryptor  *security.Encryptor
 	apiBaseURL string
 	testMode   bool // server-wide default, from KRAKEN_TEST_MODE
+	checkCreds func(apiKey, apiSecret string) string
 }
 
 func NewConnectionsHandler(db *database.DB, encryptor *security.Encryptor, apiBaseURL string, testMode bool) *ConnectionsHandler {
-	return &ConnectionsHandler{db: db, encryptor: encryptor, apiBaseURL: apiBaseURL, testMode: testMode}
+	return &ConnectionsHandler{db: db, encryptor: encryptor, apiBaseURL: apiBaseURL, testMode: testMode, checkCreds: krakenStatus}
 }
 
 type createConnectionRequest struct {
@@ -105,7 +106,7 @@ func (h *ConnectionsHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status := krakenStatus(req.KrakenAPIKey, req.KrakenAPISecret)
+	status := h.checkCreds(req.KrakenAPIKey, req.KrakenAPISecret)
 
 	token, err := generateWebhookToken()
 	if err != nil {
@@ -254,5 +255,5 @@ func (h *ConnectionsHandler) Test(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": krakenStatus(apiKey, apiSecret)})
+	writeJSON(w, http.StatusOK, map[string]string{"status": h.checkCreds(apiKey, apiSecret)})
 }
