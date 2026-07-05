@@ -30,7 +30,12 @@ func NewVerifierFromEnv() (*Verifier, error) {
 	if secret == "" {
 		return nil, fmt.Errorf("SUPABASE_JWT_SECRET not set")
 	}
-	return &Verifier{secret: []byte(secret)}, nil
+	return NewVerifier([]byte(secret)), nil
+}
+
+// NewVerifier builds a Verifier from a raw HS256 secret.
+func NewVerifier(secret []byte) *Verifier {
+	return &Verifier{secret: secret}
 }
 
 // UserIDFromToken parses and validates a Supabase access token, returning the
@@ -76,6 +81,12 @@ func (v *Verifier) Middleware(next http.HandlerFunc) http.HandlerFunc {
 		ctx := context.WithValue(r.Context(), userIDContextKey, userID)
 		next(w, r.WithContext(ctx))
 	}
+}
+
+// ContextWithUserID stores a user ID the way Middleware does; used by tests
+// to exercise handlers without a real JWT.
+func ContextWithUserID(ctx context.Context, userID string) context.Context {
+	return context.WithValue(ctx, userIDContextKey, userID)
 }
 
 // UserIDFromContext retrieves the user ID stored by Middleware.

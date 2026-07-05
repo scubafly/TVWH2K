@@ -31,6 +31,11 @@ func NewEncryptorFromEnv() (*Encryptor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ENCRYPTION_KEY is not valid base64: %w", err)
 	}
+	return NewEncryptor(key)
+}
+
+// NewEncryptor builds an Encryptor from a raw 32-byte AES-256 key.
+func NewEncryptor(key []byte) (*Encryptor, error) {
 	if len(key) != 32 {
 		return nil, fmt.Errorf("ENCRYPTION_KEY must decode to 32 bytes (AES-256), got %d", len(key))
 	}
