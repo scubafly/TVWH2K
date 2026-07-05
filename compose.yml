@@ -1,11 +1,10 @@
 x-shared: &shared
-  DEBUG_MODE: "${DEBUG_MODE}"
-  TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
-  TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID}"
-  TOKEN: "${TOKEN}"
-  KRAKEN_API_KEY: "${KRAKEN_API_KEY}"
-  KRAKEN_API_SECRET: "${KRAKEN_API_SECRET}"
-  KRAKEN_TEST_MODE: "${KRAKEN_TEST_MODE}"
+  DATABASE_URL: "${DATABASE_URL}"
+  SUPABASE_JWT_SECRET: "${SUPABASE_JWT_SECRET}"
+  ENCRYPTION_KEY: "${ENCRYPTION_KEY}"
+  API_BASE_URL: "${API_BASE_URL}"
+  FRONTEND_ORIGIN: "${FRONTEND_ORIGIN}"
+  PORT: "8081"
 
 services:
   tvwh2k:
@@ -15,4 +14,5 @@ services:
     environment:
       <<: *shared
     ports:
-     - "8081:8081"
+      - "8081:8081"
+    restart: unless-stopped

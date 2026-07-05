@@ -1,29 +1,28 @@
 package telegram
 
 import (
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
-func SendMessage(text string, chatId int64) (string, error) {
+var httpClient = &http.Client{Timeout: 10 * time.Second}
 
-	log.Printf("Sending message: %s, to chat id %d", text, chatId)
-	var apiUrl string = "https://api.telegram.org/bot" + os.Getenv("TELEGRAM_BOT_TOKEN") + "/sendMessage"
+// SendMessage posts text to the given Telegram chat using botToken.
+// botToken is per-connection (each user can wire their own bot), so it's
+// passed in rather than read from a global env var.
+func SendMessage(botToken, text string, chatId int64) (string, error) {
+	apiUrl := "https://api.telegram.org/bot" + botToken + "/sendMessage"
 
 	message := url.Values{
 		"text":    {text},
 		"chat_id": {strconv.FormatInt(chatId, 10)},
 	}
-
-	// @TODO remove printf debug lines
-	fmt.Printf("URL: %s\n", apiUrl)
-	fmt.Printf("Data: %v\n", message)
 
 	req, err := http.NewRequest(
 		http.MethodPost,
@@ -31,28 +30,27 @@ func SendMessage(text string, chatId int64) (string, error) {
 		strings.NewReader(message.Encode()),
 	)
 	if err != nil {
-		log.Printf("Error sending message: %s", err)
+		log.Printf("Error building Telegram request: %s", err)
 		return "", err
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	client := &http.Client{}
-	// TODO create timout.
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		log.Printf("Error client do: %s", err)
-		return "", err
+		// Transport errors embed the full request URL, which contains the bot
+		// token -- redact it before the error reaches any log.
+		redacted := errors.New(strings.ReplaceAll(err.Error(), botToken, "[redacted]"))
+		log.Printf("Error sending Telegram message: %s", redacted)
+		return "", redacted
 	}
 	defer resp.Body.Close()
 
-	var bodyBytes, errRead = io.ReadAll(resp.Body)
-	if errRead != nil {
-		log.Printf("Error reading response: %s", errRead)
-		return "", errRead
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading Telegram response: %s", err)
+		return "", err
 	}
-	bodyString := string(bodyBytes)
-	log.Printf("Response: %s", bodyString)
 
-	return bodyString, nil
+	return string(bodyBytes), nil
 }

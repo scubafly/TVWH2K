@@ -1,20 +1,20 @@
-FROM golang:1.23
-
-ENV TELEGRAM_BOT_TOKEN="bot_token" \
-    TELEGRAM_CHAT_ID="chat_id" \
-    TOKEN="token"
+FROM golang:1.25 AS builder
 
 WORKDIR /app
 
-COPY . .
-# remove .env file from image
-RUN rm -Rf .env
+COPY go.mod go.sum ./
+RUN go mod download
 
-RUN go build -o bin .
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/tvwh2k .
+
+FROM gcr.io/distroless/static-debian12
+
+WORKDIR /app
+COPY --from=builder /out/tvwh2k /app/tvwh2k
+
+USER nonroot:nonroot
 
 EXPOSE 8081
 
-# TODO change to non root user
-# USER 1000
-
-ENTRYPOINT [ "/app/bin" ]
+ENTRYPOINT ["/app/tvwh2k"]
