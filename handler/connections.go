@@ -29,6 +29,11 @@ func NewConnectionsHandler(db *database.DB, encryptor *security.Encryptor, apiBa
 	return &ConnectionsHandler{db: db, encryptor: encryptor, apiBaseURL: apiBaseURL, testMode: testMode, checkCreds: krakenStatus}
 }
 
+// connectionLimit caps connections per user. Beta/free tier allows one; raise
+// per tier once paid plans land. The frontend mirrors this in
+// src/lib/connections.ts (CONNECTION_LIMIT) — keep the two in sync.
+const connectionLimit = 1
+
 type createConnectionRequest struct {
 	KrakenAPIKey     string `json:"kraken_api_key"`
 	KrakenAPISecret  string `json:"kraken_api_secret"`
@@ -103,6 +108,20 @@ func (h *ConnectionsHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.KrakenAPIKey == "" || req.KrakenAPISecret == "" {
 		http.Error(w, "kraken_api_key and kraken_api_secret are required", http.StatusBadRequest)
+		return
+	}
+
+	// Count-then-insert has a small race window under concurrent requests;
+	// acceptable for this gate, which backs a cosmetic frontend limit.
+	count, err := h.db.CountConnectionsByUser(userID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to check connection limit: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if count >= connectionLimit {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error": "Connection limit reached: the beta allows 1 connection per account.",
+		})
 		return
 	}
 

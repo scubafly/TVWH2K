@@ -68,6 +68,9 @@ func TestCreateStoresConnectionAndReturnsWebhookURL(t *testing.T) {
 	db, mock := newMockDB(t)
 	h := newConnectionsHandlerForTest(t, db, "ok")
 
+	mock.ExpectQuery("SELECT COUNT").
+		WithArgs("user-1").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectQuery("INSERT INTO connections").
 		WillReturnRows(connectionRow(t, h.encryptor, 7, "tok123", true))
 
@@ -100,6 +103,9 @@ func TestCreateStoresConnectionAndReturnsWebhookURL(t *testing.T) {
 func TestCreateReportsInvalidCredentials(t *testing.T) {
 	db, mock := newMockDB(t)
 	h := newConnectionsHandlerForTest(t, db, "invalid_credentials")
+	mock.ExpectQuery("SELECT COUNT").
+		WithArgs("user-1").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectQuery("INSERT INTO connections").
 		WillReturnRows(connectionRow(t, h.encryptor, 8, "tok", true))
 
@@ -112,6 +118,34 @@ func TestCreateReportsInvalidCredentials(t *testing.T) {
 	json.Unmarshal(rec.Body.Bytes(), &resp)
 	if resp.Status != "invalid_credentials" {
 		t.Fatalf("expected invalid_credentials status, got %q", resp.Status)
+	}
+}
+
+func TestCreateRejectsOverConnectionLimit(t *testing.T) {
+	db, mock := newMockDB(t)
+	h := newConnectionsHandlerForTest(t, db, "ok")
+
+	mock.ExpectQuery("SELECT COUNT").
+		WithArgs("user-1").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(connectionLimit))
+
+	rec := httptest.NewRecorder()
+	h.Create(rec, authedRequest("POST", "/api/connections", `{"kraken_api_key":"k","kraken_api_secret":"s"}`))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 at connection limit, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Error, "Connection limit reached") {
+		t.Fatalf("expected limit error message, got %q", resp.Error)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
 
