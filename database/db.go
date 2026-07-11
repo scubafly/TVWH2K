@@ -126,6 +126,17 @@ func (db *DB) UpdateConnectionTelegram(id int64, userID string, botTokenEnc []by
 	))
 }
 
+// UpdateConnectionTestMode sets the per-connection test-mode flag (the
+// "send to Kraken" toggle): true validates orders but never sends them live.
+func (db *DB) UpdateConnectionTestMode(id int64, userID string, testMode bool) (*Connection, error) {
+	return scanConnection(db.QueryRow(
+		`UPDATE connections SET test_mode = $3
+		 WHERE id = $1 AND user_id = $2
+		 RETURNING `+connectionColumns,
+		id, userID, testMode,
+	))
+}
+
 type Signal struct {
 	ID           int64     `json:"id"`
 	ConnectionID int64     `json:"connection_id"`
