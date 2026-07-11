@@ -211,10 +211,8 @@ func TestUpdateSetsTestMode(t *testing.T) {
 		WithArgs(int64(7), "user-1").
 		WillReturnRows(connectionRow(t, h.encryptor, 7, "tok", true))
 
-	// Update always persists telegram settings first (unchanged here) ...
-	mock.ExpectQuery("UPDATE connections SET telegram_bot_token_encrypted").
-		WillReturnRows(connectionRow(t, h.encryptor, 7, "tok", true))
-	// ... then flips test_mode.
+	// A test_mode-only PATCH must not touch telegram settings: the only
+	// UPDATE expected is the test_mode one.
 	mock.ExpectQuery("UPDATE connections SET test_mode").
 		WithArgs(int64(7), "user-1", false).
 		WillReturnRows(connectionRow(t, h.encryptor, 7, "tok", false))

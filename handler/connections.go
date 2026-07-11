@@ -214,31 +214,38 @@ func (h *ConnectionsHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	botTokenEnc := conn.TelegramBotTokenEncrypted
-	chatID := conn.TelegramChatID
-	if req.TelegramBotToken != nil {
-		if *req.TelegramBotToken == "" {
-			botTokenEnc = nil
-		} else {
-			enc, err := h.encryptor.Encrypt(*req.TelegramBotToken)
-			if err != nil {
-				http.Error(w, "Failed to encrypt telegram bot token", http.StatusInternalServerError)
-				return
+	// Only touch the fields the request carries, so a test_mode-only PATCH
+	// never rewrites Telegram settings (and vice versa).
+	updated := conn
+	if req.TelegramBotToken != nil || req.TelegramChatID != nil {
+		botTokenEnc := conn.TelegramBotTokenEncrypted
+		chatID := conn.TelegramChatID
+		if req.TelegramBotToken != nil {
+			if *req.TelegramBotToken == "" {
+				botTokenEnc = nil
+			} else {
+				enc, err := h.encryptor.Encrypt(*req.TelegramBotToken)
+				if err != nil {
+					http.Error(w, "Failed to encrypt telegram bot token", http.StatusInternalServerError)
+					return
+				}
+				botTokenEnc = enc
 			}
-			botTokenEnc = enc
 		}
-	}
-	if req.TelegramChatID != nil {
-		chatID = sql.NullInt64{Int64: *req.TelegramChatID, Valid: *req.TelegramChatID != 0}
-	}
+		if req.TelegramChatID != nil {
+			chatID = sql.NullInt64{Int64: *req.TelegramChatID, Valid: *req.TelegramChatID != 0}
+		}
 
-	updated, err := h.db.UpdateConnectionTelegram(conn.ID, userID, botTokenEnc, chatID)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to update connection: %v", err), http.StatusInternalServerError)
-		return
+		var err error
+		updated, err = h.db.UpdateConnectionTelegram(conn.ID, userID, botTokenEnc, chatID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to update connection: %v", err), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	if req.TestMode != nil {
+		var err error
 		updated, err = h.db.UpdateConnectionTestMode(conn.ID, userID, *req.TestMode)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to update connection: %v", err), http.StatusInternalServerError)
