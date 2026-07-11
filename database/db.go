@@ -114,6 +114,14 @@ func (db *DB) GetConnectionsByUser(userID string) ([]Connection, error) {
 	return connections, rows.Err()
 }
 
+// CountConnectionsByUser returns how many connections a user currently has,
+// used to enforce the per-tier connection limit on create.
+func (db *DB) CountConnectionsByUser(userID string) (int, error) {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM connections WHERE user_id = $1`, userID).Scan(&n)
+	return n, err
+}
+
 // UpdateConnectionTelegram sets (or clears, when botTokenEnc is nil / chatID
 // invalid) the per-connection Telegram notification settings, scoped to the
 // owning user.
