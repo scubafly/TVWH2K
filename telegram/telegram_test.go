@@ -2,7 +2,6 @@ package telegram
 
 import (
 	"encoding/json"
-	"log"
 	"os"
 	"strconv"
 	"testing"
@@ -31,14 +30,17 @@ type Response struct {
 }
 
 func TestSendMessage(t *testing.T) {
+	if os.Getenv("TELEGRAM_BOT_TOKEN") == "" || os.Getenv("TELEGRAM_CHAT_ID") == "" {
+		t.Skip("TELEGRAM_BOT_TOKEN en TELEGRAM_CHAT_ID niet gezet, integration test overgeslagen")
+	}
 
 	text := "Runing unit test"
 	chat_id, err := strconv.Atoi(os.Getenv("TELEGRAM_CHAT_ID"))
 	if err != nil {
-		t.Errorf("error converting sting to int", err.Error())
+		t.Errorf("error converting string to int: %s", err.Error())
 	}
 
-	resp, err := SendMessage(text, chat_id))
+	resp, err := SendMessage(text, int64(chat_id))
 	if err != nil {
 		t.Errorf("Error sending message to Telegram, got %s", err.Error())
 	}

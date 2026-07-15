@@ -1,117 +1,82 @@
-// Package kraken provides a client for interacting with the Kraken REST API.
 package kraken
 
-import (
-	"encoding/json"
-	// No other standard library imports typically needed here,
-	// unless you use time.Time and need custom marshalling.
-)
+import "encoding/json"
 
-// --- Generic Response Handling ---
-
-// GenericResponse represents the basic structure of most Kraken API responses.
-// It is used internally to parse the top-level error array before processing the result.
+// GenericResponse is the top-level structure of all Kraken API responses.
 type GenericResponse struct {
-	// Error holds a list of error strings. Empty if the request was successful at the API level.
-	Error []string `json:"error"`
-	// Result holds the specific response data for the successful request.
-	// Using json.RawMessage allows delayed parsing into the specific type.
+	Error  []string        `json:"error"`
 	Result json.RawMessage `json:"result,omitempty"`
 }
 
-// --- Order Management Types ---
+// --- Order types ---
 
-// OrderInput defines the parameters for placing a new order via the AddOrder method.
-// Note: This struct serves to structure input data; it's converted to url.Values,
-// so json tags aren't used for submission but are included for clarity/potential other uses.
+// OrderInput defines the parameters for placing an order via AddOrder.
 type OrderInput struct {
-	Pair        string `json:"pair"`                  // Asset pair (e.g., "XBT/USD", "ETH/EUR")
-	Type        string `json:"type"`                  // Type of order: "buy" or "sell"
-	OrderType   string `json:"ordertype"`             // Order type (e.g., "market", "limit", "stop-loss", "take-profit", etc.)
-	Volume      string `json:"volume"`                // Order volume in base currency
-	Price       string `json:"price,omitempty"`       // Primary price (e.g., limit price) - optional depending on OrderType
-	Price2      string `json:"price2,omitempty"`      // Secondary price (e.g., stop loss price) - optional
-	UserRef     string `json:"userref,omitempty"`     // Optional user reference ID (should be parseable as int32)
-	OFlags      string `json:"oflags,omitempty"`      // Optional comma-delimited list of order flags (e.g., "fcib", "fciq", "nompp", "post")
-	TimeInForce string `json:"timeinforce,omitempty"` // Optional time-in-force policy (e.g., "GTC", "IOC", "GTD")
-	Validate    bool              `json:"-"`                     // If true, only validate inputs, don't submit. Handled in AddOrder, not sent directly.
-	Close       map[string]string `json:"close,omitempty"`       // Conditional close order parameters (e.g. ordertype, price, price2)
-	// Add more fields as needed based on Kraken documentation (leverage, starttm, expiretm, etc.)
+	Pair        string            `json:"pair"`
+	Type        string            `json:"type"`                  // "buy" or "sell"
+	OrderType   string            `json:"ordertype"`             // "market", "limit", "stop-loss", etc.
+	Volume      string            `json:"volume"`                // Base currency volume
+	Price       string            `json:"price,omitempty"`       // Primary price (limit, stop)
+	Price2      string            `json:"price2,omitempty"`      // Secondary price
+	UserRef     string            `json:"userref,omitempty"`
+	OFlags      string            `json:"oflags,omitempty"`
+	TimeInForce string            `json:"timeinforce,omitempty"`
+	Validate    bool              `json:"-"`                     // If true, validate only — do not submit.
+	Close       map[string]string `json:"close,omitempty"`       // Conditional close (TP/SL) parameters
 }
 
-// AddOrderResponse defines the structure of the 'result' field returned by a successful AddOrder call.
+// AddOrderResponse is the result of a successful AddOrder call.
 type AddOrderResponse struct {
-	Description OrderDescription `json:"descr"` // Provides descriptive information about the order.
-	TxID        []string         `json:"txid"`  // Array of transaction IDs associated with the order (usually one).
+	Description OrderDescription `json:"descr"`
+	TxID        []string         `json:"txid"`
 }
 
-// OrderDescription contains descriptive text about the order placed.
+// OrderDescription contains the human-readable order summary returned by Kraken.
 type OrderDescription struct {
-	Order string `json:"order"`           // Textual description of the order (e.g., "buy 0.1 XBT/USD @ limit 50000").
-	Close string `json:"close,omitempty"` // Textual description of the conditional close order (if applicable).
+	Order string `json:"order"`
+	Close string `json:"close,omitempty"`
 }
 
-// CancelOrderResponse defines the structure of the 'result' field returned by CancelOrder.
+// CancelOrderResponse is the result of a CancelOrder call.
 type CancelOrderResponse struct {
-	Count   int  `json:"count"`   // Number of orders successfully cancelled.
-	Pending bool `json:"pending"` // True if cancellation is pending, false otherwise.
+	Count   int  `json:"count"`
+	Pending bool `json:"pending"`
 }
 
-// --- Account Data Types ---
+// --- Account types ---
 
-// BalanceResponse defines the structure of the 'result' field for the GetBalance call.
-// It maps asset names (using Kraken's internal naming, e.g., "XXBT", "ZEUR") to balance strings.
+// BalanceResponse maps Kraken's internal asset names to their balance strings.
+// Keys use Kraken's internal notation, e.g. "XXBT", "XETH", "ZEUR".
 type BalanceResponse map[string]string
 
-// TradeBalanceResponse defines the structure of the 'result' field for the GetTradeBalance call.
-// All numerical values are returned as strings by the Kraken API to preserve precision.
+// TradeBalanceResponse contains margin account metrics returned by TradeBalance.
+// All numeric values are returned as strings by Kraken to preserve precision.
 type TradeBalanceResponse struct {
-	EquivalentBalance string `json:"eb,omitempty"` // Combined value of all currencies in base asset.
-	TradeBalance      string `json:"tb,omitempty"` // Combined value of equity currencies in base asset.
-	MarginAmount      string `json:"m,omitempty"`  // Margin amount of open positions.
-	UnrealizedNetPNL  string `json:"n,omitempty"`  // Unrealized net profit/loss of open positions.
-	CostBasis         string `json:"c,omitempty"`  // Cost basis of open positions.
-	Valuation         string `json:"v,omitempty"`  // Current floating valuation of open positions.
-	Equity            string `json:"e,omitempty"`  // Equity = trade balance + unrealized PNL.
-	FreeMargin        string `json:"mf,omitempty"` // Free margin = equity - initial margin.
-	MarginLevel       string `json:"ml,omitempty"` // Margin level = (equity / initial margin) * 100.
+	EquivalentBalance string `json:"eb,omitempty"`
+	TradeBalance      string `json:"tb,omitempty"`
+	MarginAmount      string `json:"m,omitempty"`
+	UnrealizedNetPNL  string `json:"n,omitempty"`
+	CostBasis         string `json:"c,omitempty"`
+	Valuation         string `json:"v,omitempty"`
+	Equity            string `json:"e,omitempty"`
+	FreeMargin        string `json:"mf,omitempty"`
+	MarginLevel       string `json:"ml,omitempty"`
 }
 
-// --- Other Common Types ---
+// --- Ticker types ---
 
-// Add structs for other endpoints as needed, for example:
-// - OpenOrdersResponse
-// - ClosedOrdersResponse
-// - TradesHistoryResponse
-// - LedgersResponse
-// - SystemStatusResponse
-// - AssetInfoResponse
-// - TradableAssetPairResponse
-// etc.
-
-// Example structure for Open Orders (you'd need to define OrderInfo)
-/*
-type OpenOrdersResponse struct {
-	Open map[string]OrderInfo `json:"open"`
+// TickerInfo holds market data for a single asset pair.
+type TickerInfo struct {
+	Ask       []string `json:"a"` // [price, whole lot volume, lot volume]
+	Bid       []string `json:"b"` // [price, whole lot volume, lot volume]
+	LastTrade []string `json:"c"` // [price, lot volume]
+	Volume    []string `json:"v"` // [today, last 24h]
+	VWAP      []string `json:"p"` // [today, last 24h]
+	NumTrades []int    `json:"t"` // [today, last 24h]
+	Low       []string `json:"l"` // [today, last 24h]
+	High      []string `json:"h"` // [today, last 24h]
+	OpenPrice string   `json:"o"` // Today's opening price
 }
 
-type OrderInfo struct {
-	RefID    string            `json:"refid"` // Referral order transaction ID
-	UserRef  int32             `json:"userref"` // User reference ID
-	Status   string            `json:"status"`  // Status of order (e.g., "open", "pending")
-	OpenTm   float64           `json:"opentm"`  // Unix timestamp of when order was placed
-	StartTm  float64           `json:"starttm"` // Unix timestamp of order start time (0 if not set)
-	ExpireTm float64           `json:"expiretm"`// Unix timestamp of order end time (0 if not set)
-	Descr    OrderDescription  `json:"descr"`   // Order description info
-	Vol      string            `json:"vol"`     // Volume of order in base currency
-	VolExec  string            `json:"vol_exec"`// Volume executed in base currency
-	Cost     string            `json:"cost"`    // Total cost (quote currency)
-	Fee      string            `json:"fee"`     // Total fee (quote currency)
-	Price    string            `json:"price"`   // Average price executed (quote currency)
-	StopPrice string           `json:"stopprice"`// Stop price (quote currency)
-	LimitPrice string          `json:"limitprice"`// Triggered limit price (quote currency, for trailing stops)
-	Misc     string            `json:"misc"`    // Comma delimited list of miscellaneous info
-	OFlags   string            `json:"oflags"`  // Comma delimited list of order flags
-	// Potentially add Trades field: []string `json:"trades"` // List of trade IDs related to order
-}
-*/
+// TickerResponse maps pair names to their TickerInfo.
+type TickerResponse map[string]TickerInfo
