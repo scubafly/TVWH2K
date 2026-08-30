@@ -1,0 +1,9 @@
+services:
+  tvwh2k:
+    container_name: tvwh2k
+    image: ghcr.io/scubafly/tvwh2k:latest
+    env_file:
+      - .env
+    ports:
+      - "8081:8081"
+    restart: unless-stopped
