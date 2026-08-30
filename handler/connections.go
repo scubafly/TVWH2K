@@ -45,6 +45,10 @@ type updateConnectionRequest struct {
 	// nil = leave unchanged; empty string / 0 = clear.
 	TelegramBotToken *string `json:"telegram_bot_token"`
 	TelegramChatID   *int64  `json:"telegram_chat_id"`
+	// TestMode is the "send to Kraken" toggle: true = validate-only (signals
+	// are received and logged but never sent live), false = live orders.
+	// nil = leave unchanged.
+	TestMode *bool `json:"test_mode"`
 }
 
 type connectionResponse struct {
@@ -214,9 +218,9 @@ func (h *ConnectionsHandler) ownedConnection(w http.ResponseWriter, r *http.Requ
 	return conn, userID, true
 }
 
-// Update handles PATCH /api/connections/{id}: currently the Telegram
-// notification settings (bot token + chat id). Omitted fields are left
-// unchanged; an empty bot token or chat id 0 clears the setting.
+// Update handles PATCH /api/connections/{id}: Telegram notification settings
+// (bot token + chat id) and the test_mode "send to Kraken" toggle. Omitted
+// fields are left unchanged; an empty bot token or chat id 0 clears it.
 func (h *ConnectionsHandler) Update(w http.ResponseWriter, r *http.Request) {
 	conn, userID, ok := h.ownedConnection(w, r)
 	if !ok {
@@ -229,29 +233,45 @@ func (h *ConnectionsHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	botTokenEnc := conn.TelegramBotTokenEncrypted
-	chatID := conn.TelegramChatID
-	if req.TelegramBotToken != nil {
-		if *req.TelegramBotToken == "" {
-			botTokenEnc = nil
-		} else {
-			enc, err := h.encryptor.Encrypt(*req.TelegramBotToken)
-			if err != nil {
-				http.Error(w, "Failed to encrypt telegram bot token", http.StatusInternalServerError)
-				return
+	// Only touch the fields the request carries, so a test_mode-only PATCH
+	// never rewrites Telegram settings (and vice versa).
+	updated := conn
+	if req.TelegramBotToken != nil || req.TelegramChatID != nil {
+		botTokenEnc := conn.TelegramBotTokenEncrypted
+		chatID := conn.TelegramChatID
+		if req.TelegramBotToken != nil {
+			if *req.TelegramBotToken == "" {
+				botTokenEnc = nil
+			} else {
+				enc, err := h.encryptor.Encrypt(*req.TelegramBotToken)
+				if err != nil {
+					http.Error(w, "Failed to encrypt telegram bot token", http.StatusInternalServerError)
+					return
+				}
+				botTokenEnc = enc
 			}
-			botTokenEnc = enc
+		}
+		if req.TelegramChatID != nil {
+			chatID = sql.NullInt64{Int64: *req.TelegramChatID, Valid: *req.TelegramChatID != 0}
+		}
+
+		var err error
+		updated, err = h.db.UpdateConnectionTelegram(conn.ID, userID, botTokenEnc, chatID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to update connection: %v", err), http.StatusInternalServerError)
+			return
 		}
 	}
-	if req.TelegramChatID != nil {
-		chatID = sql.NullInt64{Int64: *req.TelegramChatID, Valid: *req.TelegramChatID != 0}
+
+	if req.TestMode != nil {
+		var err error
+		updated, err = h.db.UpdateConnectionTestMode(conn.ID, userID, *req.TestMode)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to update connection: %v", err), http.StatusInternalServerError)
+			return
+		}
 	}
 
-	updated, err := h.db.UpdateConnectionTelegram(conn.ID, userID, botTokenEnc, chatID)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to update connection: %v", err), http.StatusInternalServerError)
-		return
-	}
 	writeJSON(w, http.StatusOK, h.toResponse(updated))
 }
 

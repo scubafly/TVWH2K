@@ -234,3 +234,32 @@ func TestUpdateSetsTelegramSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestUpdateSetsTestMode(t *testing.T) {
+	db, mock := newMockDB(t)
+	// Server-wide testMode=false so the response reflects the per-connection flag.
+	h := NewConnectionsHandler(db, newTestEncryptor(t), "https://api.example.com", false)
+	h.checkCreds = func(apiKey, apiSecret string) string { return "ok" }
+
+	mock.ExpectQuery("SELECT (.+) FROM connections WHERE id").
+		WithArgs(int64(7), "user-1").
+		WillReturnRows(connectionRow(t, h.encryptor, 7, "tok", true))
+
+	// A test_mode-only PATCH must not touch telegram settings: the only
+	// UPDATE expected is the test_mode one.
+	mock.ExpectQuery("UPDATE connections SET test_mode").
+		WithArgs(int64(7), "user-1", false).
+		WillReturnRows(connectionRow(t, h.encryptor, 7, "tok", false))
+
+	rec := serve(h.Update, "PATCH /api/connections/{id}",
+		authedRequest("PATCH", "/api/connections/7", `{"test_mode":false}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"test_mode":false`) {
+		t.Fatalf("expected test_mode false in response, got %s", rec.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}

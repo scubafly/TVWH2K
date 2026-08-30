@@ -238,10 +238,11 @@ func (h *WebhookHandler) processSignal(conn *database.Connection, req WebhookReq
 		log.Println(resultMsg)
 	} else {
 		status = "executed"
+		resultMsg = fmt.Sprintf("✅ Order Placed: %s", resp.Description.Order)
 		if testMode {
 			status = "validated"
+			resultMsg = fmt.Sprintf("🧪 [TEST] Order Validated (not sent): %s", resp.Description.Order)
 		}
-		resultMsg = fmt.Sprintf("✅ Order Placed: %s", resp.Description.Order)
 		if len(resp.TxID) > 0 {
 			txid = resp.TxID[0]
 			resultMsg += fmt.Sprintf("\nTxID: %s", txid)
