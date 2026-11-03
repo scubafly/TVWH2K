@@ -40,8 +40,8 @@ type WebhookHandler struct {
 	newKraken func(apiKey, apiSecret string) (orderPlacer, error)
 
 	cfg     guardConfig
-	lkLimit *rateLimiter // pre-lookup cap, every request
-	ipLimit *rateLimiter // strict, unknown tokens only
+	tokens  *TokenIndex  // valid-token set; see TokenIndex for the final design
+	ipLimit *rateLimiter // strict, tokens not in the set only
 	tkLimit *rateLimiter
 	dedup   *deduper
 	now     func() time.Time
@@ -59,6 +59,7 @@ func NewWebhookHandler(db *database.DB, encryptor *security.Encryptor, testMode 
 		encryptor: encryptor,
 		jobs:      make(chan signalJob, jobQueueSize),
 		testMode:  testMode,
+		tokens:    NewTokenIndex(),
 		now:       time.Now,
 		newKraken: func(apiKey, apiSecret string) (orderPlacer, error) {
 			return kraken.NewClient(apiKey, apiSecret)
@@ -74,10 +75,23 @@ func NewWebhookHandler(db *database.DB, encryptor *security.Encryptor, testMode 
 
 func (h *WebhookHandler) setGuardConfig(c guardConfig) {
 	h.cfg = c
-	h.lkLimit = newRateLimiter(c.LookupRatePerMin, c.LookupBurst)
 	h.ipLimit = newRateLimiter(c.IPRatePerMin, c.IPBurst)
 	h.tkLimit = newRateLimiter(c.TokenRatePerMin, c.TokenBurst)
 	h.dedup = newDeduper(c.DedupWindow)
+}
+
+// TokenIndex returns the valid-token set, to be shared with ConnectionsHandler.
+func (h *WebhookHandler) TokenIndex() *TokenIndex { return h.tokens }
+
+// LoadTokens fills the valid-token set from the database. Call before serving;
+// a failure must abort startup (an empty set would reject every webhook).
+func (h *WebhookHandler) LoadTokens() error {
+	toks, err := h.db.ListWebhookTokens()
+	if err != nil {
+		return fmt.Errorf("load webhook tokens: %w", err)
+	}
+	h.tokens.Replace(toks)
+	return nil
 }
 
 // Close stops accepting new jobs and waits for in-flight signals to finish.
@@ -134,23 +148,22 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ip := clientIP(r, h.cfg.TrustProxy, h.cfg.TrustedHops)
 
-	// Tier 1: generous per-IP cap on every request, taken before the DB lookup
-	// so a flood of garbage tokens cannot drive unbounded lookups. Set far above
-	// what TradingView can send from a shared IP.
-	if ok, wait := h.lkLimit.allow(ip, h.now()); !ok {
-		tooMany(w, wait)
+	// Unknown tokens (not in the in-memory set) consume the strict per-IP
+	// budget and never touch the DB. Known tokens get no per-IP block at all,
+	// so shared TradingView IPs are never blocked. See TokenIndex (final design).
+	if !h.tokens.Has(token) {
+		if ok, wait := h.ipLimit.allow(ip, h.now()); !ok {
+			tooMany(w, wait)
+			return
+		}
+		http.Error(w, "Unknown webhook token", http.StatusUnauthorized)
 		return
 	}
 
 	conn, err := h.db.GetConnectionByWebhookToken(token)
 	if errors.Is(err, sql.ErrNoRows) {
-		// Tier 2: strict budget consumed only by unknown tokens. It is never
-		// checked before the lookup, so it cannot block valid tokens from a
-		// shared IP; it only turns the not-found reply into a 429.
-		if ok, wait := h.ipLimit.allow(ip, h.now()); !ok {
-			tooMany(w, wait)
-			return
-		}
+		// In the set but gone from the DB (deleted/rotated elsewhere): drop it.
+		h.tokens.Remove(token)
 		http.Error(w, "Unknown webhook token", http.StatusUnauthorized)
 		return
 	}

@@ -321,62 +321,16 @@ func TestClientIPTrustedHops(t *testing.T) {
 	}
 }
 
-func TestIPLimitCountsOnlyUnknownTokens(t *testing.T) {
+func TestBadTokenFloodGets429WithZeroDBCalls(t *testing.T) {
 	cfg := defaultGuardConfig()
 	cfg.IPBurst = 2
 	cfg.IPRatePerMin = 1
-	h, mock := newGuardHandler(t, cfg)
-	h.now = func() time.Time { return time.Unix(1000, 0) }
-	for i := 0; i < 3; i++ {
-		mock.ExpectQuery("SELECT (.+) FROM connections WHERE webhook_token").
-			WithArgs("bad").WillReturnError(sql.ErrNoRows)
-		rec := postWebhook(h, "bad", `{"text":"x"}`)
-		want := http.StatusUnauthorized
-		if i == 2 {
-			want = http.StatusTooManyRequests // burst of 2 failed lookups used up
-		}
-		if rec.Code != want {
-			t.Fatalf("garbage %d: expected %d, got %d", i, want, rec.Code)
-		}
-		if want == 429 && rec.Header().Get("Retry-After") == "" {
-			t.Error("missing Retry-After")
-		}
-	}
-	// A valid token from an IP with spent failed-lookup budget still succeeds.
-	expectAccepted(t, mock, h, 1)
-	if rec := postWebhook(h, "tok", `{"text":"hi"}`); rec.Code != http.StatusAccepted {
-		t.Fatalf("valid token from exhausted IP: expected 202, got %d", rec.Code)
-	}
-}
-
-func TestValidTokensNeverConsumeIPBudget(t *testing.T) {
-	cfg := defaultGuardConfig()
-	cfg.IPBurst = 1
-	cfg.IPRatePerMin = 1
-	h, mock := newGuardHandler(t, cfg)
-	h.now = func() time.Time { return time.Unix(1000, 0) }
-	for i := 1; i <= 3; i++ {
-		expectAccepted(t, mock, h, i)
-		if rec := postWebhook(h, "tok", `{"text":"m`+strconv.Itoa(i)+`"}`); rec.Code != http.StatusAccepted {
-			t.Fatalf("req %d: expected 202, got %d", i, rec.Code)
-		}
-	}
-}
-
-func TestLookupCapBoundsDBLookupsFromOneIP(t *testing.T) {
-	cfg := defaultGuardConfig()
-	cfg.LookupBurst = 3
-	cfg.LookupRatePerMin = 1
-	h, mock := newGuardHandler(t, cfg)
+	h, mock := newGuardHandler(t, cfg) // no query expectations: any DB call fails
 	h.now = func() time.Time { return time.Unix(1000, 0) }
 	for i := 0; i < 10; i++ {
-		if i < 3 {
-			mock.ExpectQuery("SELECT (.+) FROM connections WHERE webhook_token").
-				WillReturnError(sql.ErrNoRows)
-		}
 		rec := postWebhook(h, "garbage"+strconv.Itoa(i), `{"text":"x"}`)
 		want := http.StatusUnauthorized
-		if i >= 3 {
+		if i >= 2 {
 			want = http.StatusTooManyRequests
 			if rec.Header().Get("Retry-After") == "" {
 				t.Error("missing Retry-After")
@@ -386,32 +340,80 @@ func TestLookupCapBoundsDBLookupsFromOneIP(t *testing.T) {
 			t.Fatalf("req %d: expected %d, got %d", i, want, rec.Code)
 		}
 	}
-	// Exactly 3 lookups hit the store; any further query would have failed above.
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestSharedIPValidTokenSurvivesStrictBudgetExhaustion(t *testing.T) {
+func TestValidTokenPassesFromIPWithExhaustedStrictBudget(t *testing.T) {
 	cfg := defaultGuardConfig()
 	cfg.IPBurst = 2
 	cfg.IPRatePerMin = 1
 	h, mock := newGuardHandler(t, cfg)
 	h.now = func() time.Time { return time.Unix(1000, 0) }
 	for i := 0; i < 5; i++ {
-		mock.ExpectQuery("SELECT (.+) FROM connections WHERE webhook_token").
-			WillReturnError(sql.ErrNoRows)
-		rec := postWebhook(h, "garbage"+strconv.Itoa(i), `{"text":"x"}`)
-		want := http.StatusUnauthorized
-		if i >= 2 {
-			want = http.StatusTooManyRequests
-		}
-		if rec.Code != want {
-			t.Fatalf("garbage %d: expected %d, got %d", i, want, rec.Code)
-		}
+		postWebhook(h, "garbage"+strconv.Itoa(i), `{"text":"x"}`)
+	}
+	if rec := postWebhook(h, "garbage-again", `{"text":"x"}`); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("budget should be exhausted, got %d", rec.Code)
 	}
 	expectAccepted(t, mock, h, 1)
 	if rec := postWebhook(h, "tok", `{"text":"hi"}`); rec.Code != http.StatusAccepted {
-		t.Fatalf("valid token from shared IP: expected 202, got %d", rec.Code)
+		t.Fatalf("valid token from exhausted IP: expected 202, got %d", rec.Code)
+	}
+}
+
+func TestTokenInSetButMissingInDBIsRemoved(t *testing.T) {
+	h, mock := newGuardHandler(t, defaultGuardConfig())
+	mock.ExpectQuery("SELECT (.+) FROM connections WHERE webhook_token").
+		WithArgs("tok").WillReturnError(sql.ErrNoRows)
+	if rec := postWebhook(h, "tok", `{"text":"x"}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+	if h.tokens.Has("tok") {
+		t.Fatal("token should have been removed from the set")
+	}
+	if rec := postWebhook(h, "tok", `{"text":"x"}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadTokensAtStartup(t *testing.T) {
+	db, mock := newMockDB(t)
+	h := NewWebhookHandler(db, newTestEncryptor(t), true)
+	defer h.Close()
+	mock.ExpectQuery("SELECT webhook_token FROM connections").
+		WillReturnRows(sqlmock.NewRows([]string{"webhook_token"}).AddRow("a").AddRow("b"))
+	if err := h.LoadTokens(); err != nil {
+		t.Fatal(err)
+	}
+	if !h.tokens.Has("a") || !h.tokens.Has("b") || h.tokens.Has("c") || h.tokens.Len() != 2 {
+		t.Fatal("set not loaded correctly")
+	}
+	mock.ExpectQuery("SELECT webhook_token FROM connections").WillReturnError(sql.ErrConnDone)
+	if err := h.LoadTokens(); err == nil {
+		t.Fatal("expected load error")
+	}
+}
+
+func TestTokenIndexAddRemoveRotate(t *testing.T) {
+	x := NewTokenIndex()
+	x.Add("old")
+	if !x.Has("old") {
+		t.Fatal("add")
+	}
+	// rotate = remove old + add new
+	x.Remove("old")
+	x.Add("new")
+	if x.Has("old") || !x.Has("new") {
+		t.Fatal("rotate")
+	}
+	// delete
+	x.Remove("new")
+	if x.Has("new") || x.Len() != 0 {
+		t.Fatal("delete")
 	}
 }

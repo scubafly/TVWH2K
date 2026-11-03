@@ -19,6 +19,7 @@ func newConnectionsHandlerForTest(t *testing.T, db *database.DB, status string) 
 	t.Helper()
 	h := NewConnectionsHandler(db, newTestEncryptor(t), "https://api.example.com", true)
 	h.checkCreds = func(apiKey, apiSecret string) string { return status }
+	h.tokens = NewTokenIndex()
 	return h
 }
 
@@ -94,6 +95,9 @@ func TestCreateStoresConnectionAndReturnsWebhookURL(t *testing.T) {
 	}
 	if !resp.TestMode || resp.Status != "ok" || resp.ID != 7 {
 		t.Fatalf("unexpected response: %+v", resp)
+	}
+	if !h.tokens.Has("tok123") {
+		t.Fatal("created token not added to the valid-token set")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)

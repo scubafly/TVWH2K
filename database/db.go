@@ -86,6 +86,25 @@ func (db *DB) GetConnectionByWebhookToken(token string) (*Connection, error) {
 	))
 }
 
+// ListWebhookTokens returns every connection's webhook token, to seed the
+// in-memory valid-token set at startup.
+func (db *DB) ListWebhookTokens() ([]string, error) {
+	rows, err := db.Query(`SELECT webhook_token FROM connections`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // GetConnectionByIDForUser returns the connection only if it belongs to userID,
 // so callers can scope /api/signals and /api/trades to the authenticated caller.
 func (db *DB) GetConnectionByIDForUser(id int64, userID string) (*Connection, error) {

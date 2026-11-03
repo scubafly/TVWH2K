@@ -2,7 +2,6 @@ package handler
 
 import (
 	"crypto/rand"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -88,6 +87,7 @@ func (f *fakeKraken) AddOrder(order kraken.OrderInput) (*kraken.AddOrderResponse
 func newWebhookHandlerForTest(t *testing.T, db *database.DB, fake *fakeKraken, globalTestMode bool) *WebhookHandler {
 	t.Helper()
 	h := NewWebhookHandler(db, newTestEncryptor(t), globalTestMode)
+	h.tokens.Add("tok")
 	h.newKraken = func(apiKey, apiSecret string) (orderPlacer, error) {
 		return fake, nil
 	}
@@ -108,9 +108,7 @@ const signalBody = `{"text":"BUY Signal","pair":"XBT/USD","type":"buy","ordertyp
 // --- webhook endpoint ---
 
 func TestWebhookUnknownTokenReturns401(t *testing.T) {
-	db, mock := newMockDB(t)
-	mock.ExpectQuery("SELECT (.+) FROM connections WHERE webhook_token").
-		WithArgs("nope").WillReturnError(sql.ErrNoRows)
+	db, _ := newMockDB(t) // no expectations: unknown tokens never reach the DB
 
 	h := newWebhookHandlerForTest(t, db, &fakeKraken{}, true)
 	defer h.Close()
@@ -182,6 +180,7 @@ func TestWebhookProcessesMockSignalInTestMode(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	h := NewWebhookHandler(db, enc, true)
+	h.tokens.Add("tok")
 	// The connection row above was encrypted with a *different* encryptor than
 	// the one inside connectionRow -- use the same enc for both, set here.
 	h.newKraken = func(apiKey, apiSecret string) (orderPlacer, error) {
@@ -241,6 +240,7 @@ func processSignalFresh(t *testing.T, fake *fakeKraken, connTestMode, globalTest
 	mockSetup(mock)
 
 	h := NewWebhookHandler(db, enc, globalTestMode)
+	h.tokens.Add("tok")
 	h.newKraken = func(apiKey, apiSecret string) (orderPlacer, error) { return fake, nil }
 	defer h.Close()
 
@@ -300,6 +300,7 @@ func TestProcessSignalPanicDoesNotKillWorker(t *testing.T) {
 	db, _ := newMockDB(t)
 	enc := newTestEncryptor(t)
 	h := NewWebhookHandler(db, enc, true)
+	h.tokens.Add("tok")
 	h.newKraken = func(apiKey, apiSecret string) (orderPlacer, error) {
 		panic("boom")
 	}

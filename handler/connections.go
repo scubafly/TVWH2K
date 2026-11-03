@@ -24,7 +24,11 @@ type ConnectionsHandler struct {
 	apiBaseURL string
 	testMode   bool // server-wide default, from KRAKEN_TEST_MODE
 	checkCreds func(apiKey, apiSecret string) string
+	tokens     *TokenIndex // shared with WebhookHandler; nil-safe
 }
+
+// UseTokenIndex wires the valid-webhook-token set shared with WebhookHandler.
+func (h *ConnectionsHandler) UseTokenIndex(x *TokenIndex) { h.tokens = x }
 
 func NewConnectionsHandler(db *database.DB, encryptor *security.Encryptor, apiBaseURL string, testMode bool) *ConnectionsHandler {
 	return &ConnectionsHandler{db: db, encryptor: encryptor, apiBaseURL: apiBaseURL, testMode: testMode, checkCreds: krakenStatus}
@@ -169,6 +173,7 @@ func (h *ConnectionsHandler) Create(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to create connection: %v", err), http.StatusInternalServerError)
 		return
 	}
+	h.tokens.Add(conn.WebhookToken)
 
 	if req.TelegramBotToken != "" && req.TelegramChatID != 0 {
 		botTokenEnc, err := h.encryptor.Encrypt(req.TelegramBotToken)

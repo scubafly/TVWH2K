@@ -55,7 +55,11 @@ func main() {
 	}
 
 	webhookHandler := handler.NewWebhookHandler(db, encryptor, testMode)
+	if err := webhookHandler.LoadTokens(); err != nil {
+		log.Fatalf("Failed to load webhook tokens: %v", err)
+	}
 	connectionsHandler := handler.NewConnectionsHandler(db, encryptor, apiBaseURL, testMode)
+	connectionsHandler.UseTokenIndex(webhookHandler.TokenIndex())
 
 	// Optional own-account DCA runner (off by default). Uses KRAKEN_API_KEY /
 	// KRAKEN_API_SECRET; orders are validate-only while KRAKEN_TEST_MODE != "false".

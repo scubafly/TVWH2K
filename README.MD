@@ -55,8 +55,7 @@ Safety: any `AddOrder` error that is not a clear Kraken rejection (timeout, tran
 | Env var | Default | Effect |
 |---|---|---|
 | `WEBHOOK_TOKEN_RATE_PER_MIN` / `WEBHOOK_TOKEN_BURST` | `30` / `10` | per-token token bucket, 429 + `Retry-After` when empty |
-| `WEBHOOK_IP_LOOKUP_RATE_PER_MIN` / `WEBHOOK_IP_LOOKUP_BURST` | `300` / `150` | per-client-IP cap on every webhook request, taken before the token DB lookup; bounds lookups per IP (set far above what TradingView sends from a shared IP); over cap returns 429 |
-| `WEBHOOK_IP_RATE_PER_MIN` / `WEBHOOK_IP_BURST` | `120` / `30` | per-client-IP bucket counting only failed token lookups (valid tokens use the per-token limit); once exhausted, unknown tokens from that IP get 429 until it refills, valid tokens are unaffected |
+| `WEBHOOK_IP_RATE_PER_MIN` / `WEBHOOK_IP_BURST` | `120` / `30` | per-client-IP bucket consumed only by tokens not in the in-memory valid-token set (those never hit the DB); once exhausted they get 429 until it refills. Valid tokens are never blocked per IP (they use the per-token limit) |
 | `WEBHOOK_DEDUP_WINDOW` | `60s` | identical payload (or same optional `idempotency_id`) for the same token inside the window returns 200 `{"status":"duplicate"}` and is not enqueued; `0` disables |
 | `WEBHOOK_MAX_BODY_BYTES` | `16384` | larger bodies get 413 |
 | `WEBHOOK_MAX_VOLUME` | `1000000` | volume must be a plain decimal, > 0 and <= this, else 400 |
@@ -64,6 +63,8 @@ Safety: any `AddOrder` error that is not a clear Kraken rejection (timeout, tran
 | `WEBHOOK_TRUSTED_HOPS` | `2` | number of proxies appending to `X-Forwarded-For` (1 = right-most entry). Cloudflare tunnel -> caddy -> api is 2; the bundled Caddyfile trusts private ranges only so client-sent headers cannot be spoofed past cloudflared |
 
 Signals are validated: `type` must be buy/sell, `pair` alphanumeric (optionally `BASE/QUOTE`), `ordertype` a known Kraken type, price fields numeric; payloads without pair/type/volume are accepted as text-only notifications. Limits are in-memory and per process.
+
+**Valid-token set (final design, do not revert).** The API keeps SHA-256 hashes of all webhook tokens in memory, loaded from the DB at startup (startup fails if the load fails) and updated on connection create. A token in the set goes on to the DB lookup with no per-IP block; a token not in the set only consumes the strict per-IP budget and never touches the DB. Residual risks: single process only (a second API instance or an out-of-band DB change needs a restart to refresh the set); an attacker needs a valid token to bypass the limits; shared TradingView IPs are never blocked for valid tokens.
 
 ## API
 
