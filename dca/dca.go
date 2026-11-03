@@ -67,23 +67,31 @@ type Service struct {
 	mu   sync.Mutex
 	last map[string]time.Time // position id -> last (possibly) placed DCA
 
-	stateLoaded bool // a state file existed and parsed at startup
+	stateLoaded bool  // a state file existed and parsed at startup
+	loadErr     error // state file existed but could not be read/parsed
 
 	spentDay string  // UTC day (2006-01-02) that spent refers to
 	spent    float64 // quote amount placed on spentDay
 }
 
 // New creates a Service. If cfg.StateFile is set and exists it is loaded; a
-// corrupt file is logged and ignored (starts empty).
+// corrupt file is logged and ignored (starts empty); callers that must not
+// run without state check StartupError.
 func New(src Source, cfg Config) *Service {
 	s := &Service{src: src, cfg: cfg, now: time.Now, last: make(map[string]time.Time)}
 	if cfg.StateFile != "" {
 		if err := s.loadState(); err != nil {
 			log.Printf("DCA WARNING: cannot load state file %s: %v", cfg.StateFile, err)
+			s.loadErr = err
 		}
 	}
 	return s
 }
+
+// StartupError is non-nil when the state file exists but is corrupt/unreadable.
+// In live mode the caller must refuse to start: cooldown and daily spend are
+// unknown and starting empty could duplicate buys.
+func (s *Service) StartupError() error { return s.loadErr }
 
 type stateFile struct {
 	Last     map[string]time.Time `json:"last"`
@@ -157,20 +165,32 @@ func (s *Service) spentToday() float64 {
 }
 
 // definiteRejection reports whether err is a clear Kraken API rejection, i.e.
-// the order certainly was not placed. Transport errors, timeouts, non-2xx
-// responses, unparsable bodies and ambiguous EService errors (Busy, Timeout,
-// Unavailable) may have left a live order and are NOT definite.
+// the order certainly was not placed. Only an allowlist of validation/permission
+// errors counts; transport errors, timeouts, non-2xx responses, unparsable
+// bodies, EGeneral:Internal error, EService:* and unknown errors may have left
+// a live order and are NOT definite.
 func definiteRejection(err error) bool {
 	var ae *kraken.APIError
 	if !errors.As(err, &ae) || len(ae.Messages) == 0 {
 		return false
 	}
 	for _, m := range ae.Messages {
-		if strings.HasPrefix(m, "EService:") {
+		if !definiteMessage(m) {
 			return false
 		}
 	}
 	return true
+}
+
+func definiteMessage(m string) bool {
+	switch {
+	case m == "EGeneral:Invalid arguments", m == "EGeneral:Permission denied",
+		strings.HasPrefix(m, "EGeneral:Invalid arguments:"),
+		strings.HasPrefix(m, "EOrder:"), strings.HasPrefix(m, "EFunding:"),
+		m == "EAPI:Invalid key", m == "EAPI:Invalid signature", m == "EAPI:Invalid nonce":
+		return true
+	}
+	return false
 }
 
 // userRef derives a deterministic positive int32 reference for a position and
@@ -277,6 +297,7 @@ func (s *Service) RunOnce() error {
 	type cand struct {
 		asset, pair     string
 		vol, price, val float64
+		lotDec          int
 	}
 	var errs []error
 	var cands []cand
@@ -301,7 +322,7 @@ func (s *Service) RunOnce() error {
 		if vol*price < s.cfg.MinValueEUR {
 			continue // dust
 		}
-		cands = append(cands, cand{a, pair, vol, price, vol * price})
+		cands = append(cands, cand{a, pair, vol, price, vol * price, lotDecimals(pairs[pair])})
 	}
 
 	if len(cands) > 0 {
@@ -319,7 +340,7 @@ func (s *Service) RunOnce() error {
 			byPair[key] = append(byPair[key], t)
 		}
 		for _, c := range cands {
-			if err := s.handle(c.asset, c.pair, c.vol, c.price, byPair[c.pair]); err != nil {
+			if err := s.handle(c.asset, c.pair, c.vol, c.price, c.lotDec, byPair[c.pair]); err != nil {
 				log.Printf("DCA WARNING: %v", err)
 				errs = append(errs, err)
 			}
@@ -328,7 +349,7 @@ func (s *Service) RunOnce() error {
 	return errors.Join(errs...)
 }
 
-func (s *Service) handle(asset, pair string, balance, price float64, trades []kraken.Trade) error {
+func (s *Service) handle(asset, pair string, balance, price float64, lotDec int, trades []kraken.Trade) error {
 	id := asset + "/" + pair
 	vol, avg, ok, err := AverageCost(trades)
 	if err != nil {
@@ -367,7 +388,7 @@ func (s *Service) handle(asset, pair string, balance, price float64, trades []kr
 		Pair:      pair,
 		Type:      "buy",
 		OrderType: "market",
-		Volume:    strconv.FormatFloat(s.cfg.AmountEUR/price, 'f', 8, 64),
+		Volume:    strconv.FormatFloat(roundDown(s.cfg.AmountEUR/price, lotDec), 'f', lotDec, 64),
 		Validate:  s.cfg.TestMode,
 	}
 	resp, err := s.src.PlaceOrder(order)
@@ -391,6 +412,21 @@ func (s *Service) handle(asset, pair string, balance, price float64, trades []kr
 	log.Printf("DCA: position %s avg entry %.4f price %.4f pnl %.2f%% < %.2f%%, placed buy %s (validate=%t): %s",
 		id, avg, price, pnl, s.cfg.Threshold, order.Volume, s.cfg.TestMode, resp.Description.Order)
 	return nil
+}
+
+// lotDecimals is the pair's volume precision; 8 when Kraken did not report it.
+func lotDecimals(p kraken.AssetPair) int {
+	if p.LotDecimals == nil {
+		return 8
+	}
+	return *p.LotDecimals
+}
+
+// roundDown truncates v to dec decimals (never rounds up, so the order never
+// exceeds the intended quote amount).
+func roundDown(v float64, dec int) float64 {
+	m := math.Pow(10, float64(dec))
+	return math.Floor(v*m+1e-9) / m
 }
 
 // Run evaluates on every interval tick until ctx is cancelled.
@@ -462,6 +498,10 @@ func ConfigFromEnv() (Config, time.Duration, error) {
 	if err != nil {
 		return Config{}, 0, err
 	}
+	testMode := !(os.Getenv("KRAKEN_TEST_MODE") == "false" && os.Getenv("DCA_LIVE") == "true")
+	if !testMode && os.Getenv("DCA_STATE_FILE") == "" {
+		return Config{}, 0, fmt.Errorf("DCA_STATE_FILE is required when DCA is live (KRAKEN_TEST_MODE=false and DCA_LIVE=true)")
+	}
 	if mins <= 0 || hours < 0 {
 		return Config{}, 0, fmt.Errorf("DCA_INTERVAL_MINUTES must be > 0 and DCA_COOLDOWN_HOURS >= 0")
 	}
@@ -473,7 +513,7 @@ func ConfigFromEnv() (Config, time.Duration, error) {
 		MaxDailyEUR: maxDaily,
 		StateFile:   os.Getenv("DCA_STATE_FILE"),
 		// Live orders need BOTH switches; anything else is validate-only.
-		TestMode: !(os.Getenv("KRAKEN_TEST_MODE") == "false" && os.Getenv("DCA_LIVE") == "true"),
+		TestMode: testMode,
 	}, time.Duration(mins * float64(time.Minute)), nil
 }
 

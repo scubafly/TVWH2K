@@ -70,7 +70,14 @@ func main() {
 		if err != nil {
 			log.Fatalf("DCA enabled but Kraken client failed: %v", err)
 		}
-		go dca.New(&dca.KrakenSource{K: kc}, dcaCfg).Run(dcaCtx, dcaInterval)
+		dcaSvc := dca.New(&dca.KrakenSource{K: kc}, dcaCfg)
+		if err := dcaSvc.StartupError(); err != nil {
+			if !dcaCfg.TestMode {
+				log.Fatalf("DCA live: refusing to start with unreadable/corrupt state file: %v", err)
+			}
+			log.Printf("DCA validate mode: continuing despite state file error: %v", err)
+		}
+		go dcaSvc.Run(dcaCtx, dcaInterval)
 		fmt.Printf("DCA runner enabled (threshold %.1f%%, amount %.2f, interval %s, validate-only=%t).\n",
 			dcaCfg.Threshold, dcaCfg.AmountEUR, dcaInterval, dcaCfg.TestMode)
 	}

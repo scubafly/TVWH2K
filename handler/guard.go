@@ -145,6 +145,21 @@ func (l *rateLimiter) allow(key string, now time.Time) (bool, time.Duration) {
 	return false, time.Duration((1 - b.tokens) / l.perSec * float64(time.Second))
 }
 
+// exhausted reports, without consuming a token, whether key has no token left.
+func (l *rateLimiter) exhausted(key string, now time.Time) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[key]
+	if !ok {
+		return false, 0
+	}
+	tokens := math.Min(l.burst, b.tokens+now.Sub(b.last).Seconds()*l.perSec)
+	if tokens >= 1 {
+		return false, 0
+	}
+	return true, time.Duration((1 - tokens) / l.perSec * float64(time.Second))
+}
+
 // --- dedup ---
 
 type deduper struct {

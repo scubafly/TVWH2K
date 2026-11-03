@@ -35,7 +35,7 @@ PORT=8081
 ## DCA runner (optional, own account)
 Off by default; does not touch the webhook. Averages down losing **spot** holdings (no margin) by buying `DCA_AMOUNT_EUR` of the EUR pair when unrealized PnL is below the threshold. Positions come from account balances; cost basis is the volume-weighted average entry from trade history (average-cost: sells reduce volume at the average cost, buy fees count as cost). EUR, stablecoins, staked assets and dust below `DCA_MIN_VALUE_EUR` are skipped, as is any asset whose balance exceeds the trade-history volume (deposits/transfers: unknown basis). Orders are validate-only unless `KRAKEN_TEST_MODE=false` and `DCA_LIVE=true`. Margin trades (margin amount or position status set) are ignored for the cost basis; trades are de-duplicated by txid. Without a loaded `DCA_STATE_FILE` the first check happens one interval after start.
 
-Safety: any `AddOrder` error that is not a clear Kraken rejection (timeout, transport error, non-2xx, `EService:*`) is treated as possibly placed, so the cooldown and daily spend are recorded and no duplicate is sent; the order carries a deterministic `userref` (hash of position + UTC day) to find it on Kraken. Spend per UTC day is capped by `DCA_MAX_DAILY_EUR`. Known limitations: the cooldown and daily spend are in-memory unless `DCA_STATE_FILE` is set (otherwise a restart can trigger another buy); overlaps with tribot `cmd/portfolio`, which already does spot DCA, so do not run both on the same account.
+Safety: any `AddOrder` error that is not a clear Kraken rejection (timeout, transport error, non-2xx, `EService:*`, internal errors) is treated as possibly placed, so the cooldown and daily spend are recorded and no duplicate is sent; the order carries a deterministic `userref` (hash of position + UTC day) to find it on Kraken. Only an allowlist (`EGeneral:Invalid arguments`/`Permission denied`, `EOrder:*`, `EFunding:*`, `EAPI:Invalid key/signature/nonce`) counts as a clear rejection; `EGeneral:Internal error`, `EService:*` and unknown errors are ambiguous. Volume is rounded down to the pair's `lot_decimals`. Live mode requires `DCA_STATE_FILE` and refuses to start if that file is corrupt. Spend per UTC day is capped by `DCA_MAX_DAILY_EUR`. Known limitations: the cooldown and daily spend are in-memory unless `DCA_STATE_FILE` is set (otherwise a restart can trigger another buy); overlaps with tribot `cmd/portfolio`, which already does spot DCA, so do not run both on the same account.
 
 | Env var | Default | Effect |
 |---|---|---|
@@ -47,7 +47,7 @@ Safety: any `AddOrder` error that is not a clear Kraken rejection (timeout, tran
 | `DCA_MIN_VALUE_EUR` | `5` | holdings worth less are ignored as dust |
 | `DCA_INTERVAL_MINUTES` | `5` | check interval |
 | `DCA_MAX_DAILY_EUR` | `3 x DCA_AMOUNT_EUR` | max quote amount placed per UTC day (also counts possibly-placed orders); `0` disables |
-| `DCA_STATE_FILE` | empty | JSON file (mode 600, atomic write) persisting last-DCA times and daily spend across restarts; empty = memory only |
+| `DCA_STATE_FILE` | empty | JSON file (mode 600, atomic write) persisting last-DCA times and daily spend across restarts; **required when live**, empty = memory only (validate mode) |
 
 ## Webhook hardening
 `POST /webhooks/{token}` is protected by (all env vars optional):
@@ -55,7 +55,7 @@ Safety: any `AddOrder` error that is not a clear Kraken rejection (timeout, tran
 | Env var | Default | Effect |
 |---|---|---|
 | `WEBHOOK_TOKEN_RATE_PER_MIN` / `WEBHOOK_TOKEN_BURST` | `30` / `10` | per-token token bucket, 429 + `Retry-After` when empty |
-| `WEBHOOK_IP_RATE_PER_MIN` / `WEBHOOK_IP_BURST` | `120` / `30` | per-client-IP bucket counting only unknown-token requests (valid tokens use the per-token limit) |
+| `WEBHOOK_IP_RATE_PER_MIN` / `WEBHOOK_IP_BURST` | `120` / `30` | per-client-IP bucket counting only failed token lookups (valid tokens use the per-token limit); once exhausted, that IP gets 429 for any token until it refills |
 | `WEBHOOK_DEDUP_WINDOW` | `60s` | identical payload (or same optional `idempotency_id`) for the same token inside the window returns 200 `{"status":"duplicate"}` and is not enqueued; `0` disables |
 | `WEBHOOK_MAX_BODY_BYTES` | `16384` | larger bodies get 413 |
 | `WEBHOOK_MAX_VOLUME` | `1000000` | volume must be a plain decimal, > 0 and <= this, else 400 |

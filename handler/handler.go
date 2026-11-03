@@ -130,12 +130,22 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Trade-off: once an IP has exhausted its failed-lookup budget, even valid
+	// tokens from that IP get 429 until it refills. Shared TradingView IPs only
+	// exhaust the budget through failed lookups, so legitimate traffic is not
+	// affected unless someone is guessing tokens from the same IP.
+	ip := clientIP(r, h.cfg.TrustProxy, h.cfg.TrustedHops)
+	if ex, wait := h.ipLimit.exhausted(ip, h.now()); ex {
+		tooMany(w, wait)
+		return
+	}
+
 	conn, err := h.db.GetConnectionByWebhookToken(token)
 	if errors.Is(err, sql.ErrNoRows) {
 		// TradingView alerts come from a few shared IPs, so a plain per-IP
 		// limit would throttle every user. The IP limiter only counts failed
 		// token lookups; valid tokens are limited per token (below).
-		if ok, wait := h.ipLimit.allow(clientIP(r, h.cfg.TrustProxy, h.cfg.TrustedHops), h.now()); !ok {
+		if ok, wait := h.ipLimit.allow(ip, h.now()); !ok {
 			tooMany(w, wait)
 			return
 		}

@@ -15,6 +15,8 @@ type AssetPair struct {
 	Base    string `json:"base"`    // e.g. XXBT
 	Quote   string `json:"quote"`   // e.g. ZEUR
 	WSName  string `json:"wsname"`  // e.g. XBT/EUR
+	// LotDecimals is the volume precision; nil when not reported.
+	LotDecimals *int `json:"lot_decimals"`
 }
 
 // TickerInfo is the subset of Ticker info we use.

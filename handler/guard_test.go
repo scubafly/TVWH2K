@@ -328,8 +328,10 @@ func TestIPLimitCountsOnlyUnknownTokens(t *testing.T) {
 	h, mock := newGuardHandler(t, cfg)
 	h.now = func() time.Time { return time.Unix(1000, 0) }
 	for i := 0; i < 3; i++ {
-		mock.ExpectQuery("SELECT (.+) FROM connections WHERE webhook_token").
-			WithArgs("bad").WillReturnError(sql.ErrNoRows)
+		if i < 2 { // the third request is rejected before any lookup
+			mock.ExpectQuery("SELECT (.+) FROM connections WHERE webhook_token").
+				WithArgs("bad").WillReturnError(sql.ErrNoRows)
+		}
 		rec := postWebhook(h, "bad", `{"text":"x"}`)
 		want := http.StatusUnauthorized
 		if i == 2 {
@@ -342,10 +344,10 @@ func TestIPLimitCountsOnlyUnknownTokens(t *testing.T) {
 			t.Error("missing Retry-After")
 		}
 	}
-	// A valid token from the same IP at the same instant is unaffected.
-	expectAccepted(t, mock, h, 1)
-	if rec := postWebhook(h, "tok", `{"text":"hi"}`); rec.Code != http.StatusAccepted {
-		t.Fatalf("valid token: expected 202, got %d", rec.Code)
+	// Documented trade-off: a valid token from an exhausted IP is also 429
+	// (no lookup happens).
+	if rec := postWebhook(h, "tok", `{"text":"hi"}`); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("valid token from exhausted IP: expected 429, got %d", rec.Code)
 	}
 }
 

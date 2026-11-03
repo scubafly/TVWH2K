@@ -169,7 +169,7 @@ func TestThreshold(t *testing.T) {
 				if o.Type != "buy" || o.Pair != "XXBTZEUR" || o.Validate {
 					t.Errorf("unexpected order %+v", o)
 				}
-				if o.Volume != "0.05882353" { // 50/850
+				if o.Volume != "0.05882352" { // 50/850
 					t.Errorf("volume = %s", o.Volume)
 				}
 			}
@@ -302,6 +302,70 @@ func TestDefiniteRejectionDoesNotSetCooldown(t *testing.T) {
 	}
 }
 
+func TestDefiniteRejectionAllowlist(t *testing.T) {
+	cases := map[string]bool{
+		"EGeneral:Invalid arguments": true, "EGeneral:Permission denied": true,
+		"EOrder:Insufficient funds": true, "EOrder:Order minimum not met": true,
+		"EFunding:Unknown withdraw key": true, "EAPI:Invalid key": true,
+		"EAPI:Invalid signature": true, "EAPI:Invalid nonce": true,
+		"EGeneral:Internal error": false, "EService:Busy": false,
+		"EService:Unavailable": false, "EWhatever:new": false,
+	}
+	for m, want := range cases {
+		if got := definiteRejection(&kraken.APIError{Messages: []string{m}}); got != want {
+			t.Errorf("%s: got %v want %v", m, got, want)
+		}
+	}
+	if definiteRejection(&kraken.APIError{Messages: []string{"EOrder:x", "EService:Busy"}}) {
+		t.Error("mixed with ambiguous must not be definite")
+	}
+}
+
+func TestLiveRequiresStateFile(t *testing.T) {
+	t.Setenv("DCA_AMOUNT_EUR", "50")
+	t.Setenv("KRAKEN_TEST_MODE", "false")
+	t.Setenv("DCA_LIVE", "true")
+	t.Setenv("DCA_STATE_FILE", "")
+	if _, _, err := ConfigFromEnv(); err == nil {
+		t.Error("live without DCA_STATE_FILE must fail")
+	}
+	t.Setenv("DCA_STATE_FILE", "/tmp/x.json")
+	if _, _, err := ConfigFromEnv(); err != nil {
+		t.Errorf("live with state file: %v", err)
+	}
+	t.Setenv("DCA_LIVE", "false")
+	t.Setenv("DCA_STATE_FILE", "")
+	if _, _, err := ConfigFromEnv(); err != nil {
+		t.Errorf("validate mode without state file: %v", err)
+	}
+}
+
+func TestCorruptStateFileStartupError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.json")
+	os.WriteFile(path, []byte("{nope"), 0o600)
+	if New(&fakeSource{}, Config{StateFile: path}).StartupError() == nil {
+		t.Error("expected StartupError for corrupt state")
+	}
+	if New(&fakeSource{}, Config{StateFile: path + ".missing"}).StartupError() != nil {
+		t.Error("missing file is not an error")
+	}
+}
+
+func TestVolumeRoundedDownToLotDecimals(t *testing.T) {
+	f := btcSource(850) // 50/850 = 0.0588235294...
+	three := 3
+	old := fakePairs["XXBTZEUR"]
+	p := old
+	p.LotDecimals = &three
+	fakePairs["XXBTZEUR"] = p
+	defer func() { fakePairs["XXBTZEUR"] = old }()
+	s, _ := newSvc(f, false)
+	s.RunOnce()
+	if len(f.orders) != 1 || f.orders[0].Volume != "0.058" {
+		t.Fatalf("orders = %+v, want volume 0.058", f.orders)
+	}
+}
+
 func TestDailyCapBlocks(t *testing.T) {
 	f := btcSource(850)
 	f.balances["XETH"] = 1
@@ -375,6 +439,7 @@ func TestConfigThresholdMustBeNegative(t *testing.T) {
 
 func TestConfigLiveNeedsBothSwitches(t *testing.T) {
 	t.Setenv("DCA_AMOUNT_EUR", "25")
+	t.Setenv("DCA_STATE_FILE", "/tmp/dca-state.json")
 	for _, tc := range []struct {
 		km, live string
 		wantTest bool
