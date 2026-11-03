@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -42,6 +43,7 @@ type Connection struct {
 	KrakenAPISecretEncrypted  []byte
 	WebhookToken              string
 	TestMode                  bool
+	LiveEnabled               bool
 	TelegramBotTokenEncrypted []byte
 	TelegramChatID            sql.NullInt64
 	CreatedAt                 time.Time
@@ -49,7 +51,7 @@ type Connection struct {
 
 // connectionColumns is the canonical column list for scanning a Connection;
 // keep in sync with scanConnection.
-const connectionColumns = `id, user_id, exchange, kraken_api_key_encrypted, kraken_api_secret_encrypted, webhook_token, test_mode, telegram_bot_token_encrypted, telegram_chat_id, created_at`
+const connectionColumns = `id, user_id, exchange, kraken_api_key_encrypted, kraken_api_secret_encrypted, webhook_token, test_mode, live_enabled, telegram_bot_token_encrypted, telegram_chat_id, created_at`
 
 type rowScanner interface {
 	Scan(dest ...interface{}) error
@@ -57,19 +59,19 @@ type rowScanner interface {
 
 func scanConnection(row rowScanner) (*Connection, error) {
 	var c Connection
-	err := row.Scan(&c.ID, &c.UserID, &c.Exchange, &c.KrakenAPIKeyEncrypted, &c.KrakenAPISecretEncrypted, &c.WebhookToken, &c.TestMode, &c.TelegramBotTokenEncrypted, &c.TelegramChatID, &c.CreatedAt)
+	err := row.Scan(&c.ID, &c.UserID, &c.Exchange, &c.KrakenAPIKeyEncrypted, &c.KrakenAPISecretEncrypted, &c.WebhookToken, &c.TestMode, &c.LiveEnabled, &c.TelegramBotTokenEncrypted, &c.TelegramChatID, &c.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return &c, nil
 }
 
-func (db *DB) CreateConnection(userID string, apiKeyEnc, apiSecretEnc []byte, webhookToken string, testMode bool) (*Connection, error) {
+func (db *DB) CreateConnection(userID string, apiKeyEnc, apiSecretEnc []byte, webhookToken string, testMode, liveEnabled bool) (*Connection, error) {
 	c, err := scanConnection(db.QueryRow(
-		`INSERT INTO connections (user_id, kraken_api_key_encrypted, kraken_api_secret_encrypted, webhook_token, test_mode)
-		 VALUES ($1, $2, $3, $4, $5)
+		`INSERT INTO connections (user_id, kraken_api_key_encrypted, kraken_api_secret_encrypted, webhook_token, test_mode, live_enabled)
+		 VALUES ($1, $2, $3, $4, $5, $6)
 		 RETURNING `+connectionColumns,
-		userID, apiKeyEnc, apiSecretEnc, webhookToken, testMode,
+		userID, apiKeyEnc, apiSecretEnc, webhookToken, testMode, liveEnabled,
 	))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create connection: %w", err)
@@ -236,4 +238,62 @@ func (db *DB) GetRecentTrades(connectionID int64, limit int) ([]Trade, error) {
 		trades = append(trades, t)
 	}
 	return trades, rows.Err()
+}
+
+// UpdateConnectionLiveEnabled sets the per-connection live-trading opt-in.
+func (db *DB) UpdateConnectionLiveEnabled(id int64, userID string, liveEnabled bool) (*Connection, error) {
+	return scanConnection(db.QueryRow(
+		`UPDATE connections SET live_enabled = $3
+		 WHERE id = $1 AND user_id = $2
+		 RETURNING `+connectionColumns,
+		id, userID, liveEnabled,
+	))
+}
+
+// GetConnectionByID returns the connection with the given id (no ownership
+// check; for internal use such as re-reading live flags before an order).
+func (db *DB) GetConnectionByID(id int64) (*Connection, error) {
+	return scanConnection(db.QueryRow(
+		`SELECT `+connectionColumns+` FROM connections WHERE id = $1`,
+		id,
+	))
+}
+
+// ConnectionPatch lists the fields to change; nil fields are left untouched.
+type ConnectionPatch struct {
+	SetTelegram bool // when true, BotTokenEnc/ChatID are written (nil/invalid clears)
+	BotTokenEnc []byte
+	ChatID      sql.NullInt64
+	TestMode    *bool
+	LiveEnabled *bool
+}
+
+// UpdateConnection applies all requested changes in a single UPDATE, so a
+// multi-field PATCH is atomic. With an empty patch it just re-reads the row.
+func (db *DB) UpdateConnection(id int64, userID string, p ConnectionPatch) (*Connection, error) {
+	args := []interface{}{id, userID}
+	var sets []string
+	add := func(col string, v interface{}) {
+		args = append(args, v)
+		sets = append(sets, fmt.Sprintf("%s = $%d", col, len(args)))
+	}
+	if p.SetTelegram {
+		add("telegram_bot_token_encrypted", p.BotTokenEnc)
+		add("telegram_chat_id", p.ChatID)
+	}
+	if p.TestMode != nil {
+		add("test_mode", *p.TestMode)
+	}
+	if p.LiveEnabled != nil {
+		add("live_enabled", *p.LiveEnabled)
+	}
+	if len(sets) == 0 {
+		return db.GetConnectionByIDForUser(id, userID)
+	}
+	return scanConnection(db.QueryRow(
+		`UPDATE connections SET `+strings.Join(sets, ", ")+`
+		 WHERE id = $1 AND user_id = $2
+		 RETURNING `+connectionColumns,
+		args...,
+	))
 }

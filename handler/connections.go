@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -39,6 +40,9 @@ type createConnectionRequest struct {
 	KrakenAPISecret  string `json:"kraken_api_secret"`
 	TelegramBotToken string `json:"telegram_bot_token,omitempty"`
 	TelegramChatID   int64  `json:"telegram_chat_id,omitempty"`
+	// LiveEnabled opts the connection in to real orders; true requires ConfirmLive.
+	LiveEnabled bool `json:"live_enabled,omitempty"`
+	ConfirmLive bool `json:"confirm_live,omitempty"`
 }
 
 type updateConnectionRequest struct {
@@ -49,12 +53,17 @@ type updateConnectionRequest struct {
 	// are received and logged but never sent live), false = live orders.
 	// nil = leave unchanged.
 	TestMode *bool `json:"test_mode"`
+	// LiveEnabled: nil = unchanged. Setting true requires ConfirmLive: true.
+	LiveEnabled *bool `json:"live_enabled"`
+	ConfirmLive bool  `json:"confirm_live"`
 }
 
 type connectionResponse struct {
 	ID              int64  `json:"id"`
 	WebhookURL      string `json:"webhook_url"`
 	TestMode        bool   `json:"test_mode"`
+	LiveEnabled     bool   `json:"live_enabled"`
+	EffectiveLive   bool   `json:"effective_live"` // real orders would actually be placed
 	TelegramEnabled bool   `json:"telegram_enabled"`
 	CreatedAt       string `json:"created_at"`
 }
@@ -69,6 +78,8 @@ func (h *ConnectionsHandler) toResponse(c *database.Connection) connectionRespon
 		ID:              c.ID,
 		WebhookURL:      fmt.Sprintf("%s/webhooks/%s", h.apiBaseURL, c.WebhookToken),
 		TestMode:        h.testMode || c.TestMode,
+		LiveEnabled:     c.LiveEnabled,
+		EffectiveLive:   shouldPlaceLive(h.testMode, c),
 		TelegramEnabled: c.TelegramChatID.Valid && len(c.TelegramBotTokenEncrypted) > 0,
 		CreatedAt:       c.CreatedAt.Format(time.RFC3339),
 	}
@@ -115,6 +126,11 @@ func (h *ConnectionsHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := validateLiveOptIn(req.LiveEnabled, req.ConfirmLive); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	// Count-then-insert has a small race window under concurrent requests;
 	// acceptable for this gate, which backs a cosmetic frontend limit.
 	count, err := h.db.CountConnectionsByUser(userID)
@@ -148,7 +164,7 @@ func (h *ConnectionsHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := h.db.CreateConnection(userID, keyEnc, secretEnc, token, h.testMode)
+	conn, err := h.db.CreateConnection(userID, keyEnc, secretEnc, token, h.testMode, req.LiveEnabled)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create connection: %v", err), http.StatusInternalServerError)
 		return
@@ -233,9 +249,29 @@ func (h *ConnectionsHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Only touch the fields the request carries, so a test_mode-only PATCH
-	// never rewrites Telegram settings (and vice versa).
-	updated := conn
+	if req.LiveEnabled != nil {
+		if err := validateLiveOptIn(*req.LiveEnabled, req.ConfirmLive); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Any change that flips effective_live from false to true (e.g. test_mode
+	// false on a connection that already opted in) needs explicit confirmation.
+	next := *conn
+	if req.TestMode != nil {
+		next.TestMode = *req.TestMode
+	}
+	if req.LiveEnabled != nil {
+		next.LiveEnabled = *req.LiveEnabled
+	}
+	if !shouldPlaceLive(h.testMode, conn) && shouldPlaceLive(h.testMode, &next) && !req.ConfirmLive {
+		http.Error(w, "enabling live trading requires confirm_live=true", http.StatusBadRequest)
+		return
+	}
+
+	// Only touch the fields the request carries, applied in one atomic UPDATE.
+	patch := database.ConnectionPatch{TestMode: req.TestMode, LiveEnabled: req.LiveEnabled}
 	if req.TelegramBotToken != nil || req.TelegramChatID != nil {
 		botTokenEnc := conn.TelegramBotTokenEncrypted
 		chatID := conn.TelegramChatID
@@ -254,24 +290,14 @@ func (h *ConnectionsHandler) Update(w http.ResponseWriter, r *http.Request) {
 		if req.TelegramChatID != nil {
 			chatID = sql.NullInt64{Int64: *req.TelegramChatID, Valid: *req.TelegramChatID != 0}
 		}
-
-		var err error
-		updated, err = h.db.UpdateConnectionTelegram(conn.ID, userID, botTokenEnc, chatID)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to update connection: %v", err), http.StatusInternalServerError)
-			return
-		}
+		patch.SetTelegram, patch.BotTokenEnc, patch.ChatID = true, botTokenEnc, chatID
 	}
 
-	if req.TestMode != nil {
-		var err error
-		updated, err = h.db.UpdateConnectionTestMode(conn.ID, userID, *req.TestMode)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to update connection: %v", err), http.StatusInternalServerError)
-			return
-		}
+	updated, err := h.db.UpdateConnection(conn.ID, userID, patch)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to update connection: %v", err), http.StatusInternalServerError)
+		return
 	}
-
 	writeJSON(w, http.StatusOK, h.toResponse(updated))
 }
 
@@ -295,4 +321,19 @@ func (h *ConnectionsHandler) Test(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": h.checkCreds(apiKey, apiSecret)})
+}
+
+// validateLiveOptIn rejects enabling live trading without explicit confirmation.
+func validateLiveOptIn(liveEnabled, confirmLive bool) error {
+	if liveEnabled && !confirmLive {
+		return errors.New("live_enabled=true requires confirm_live=true")
+	}
+	return nil
+}
+
+// shouldPlaceLive is the single order-execution gate: a real order is placed
+// only if the server is not in test mode, the connection is not in test mode
+// and the connection has opted in to live trading. Otherwise validate-only.
+func shouldPlaceLive(serverTestMode bool, conn *database.Connection) bool {
+	return !serverTestMode && !conn.TestMode && conn.LiveEnabled
 }

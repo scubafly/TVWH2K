@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 
 	"tvwh2k/database"
 	"tvwh2k/kraken"
@@ -37,6 +38,12 @@ type WebhookHandler struct {
 	wg        sync.WaitGroup
 	testMode  bool // global kill-switch: when true, all Kraken orders are validate-only
 	newKraken func(apiKey, apiSecret string) (orderPlacer, error)
+
+	cfg     guardConfig
+	ipLimit *rateLimiter
+	tkLimit *rateLimiter
+	dedup   *deduper
+	now     func() time.Time
 }
 
 type signalJob struct {
@@ -51,15 +58,24 @@ func NewWebhookHandler(db *database.DB, encryptor *security.Encryptor, testMode 
 		encryptor: encryptor,
 		jobs:      make(chan signalJob, jobQueueSize),
 		testMode:  testMode,
+		now:       time.Now,
 		newKraken: func(apiKey, apiSecret string) (orderPlacer, error) {
 			return kraken.NewClient(apiKey, apiSecret)
 		},
 	}
+	h.setGuardConfig(guardConfigFromEnv())
 	h.wg.Add(workerCount)
 	for i := 0; i < workerCount; i++ {
 		go h.worker()
 	}
 	return h
+}
+
+func (h *WebhookHandler) setGuardConfig(c guardConfig) {
+	h.cfg = c
+	h.ipLimit = newRateLimiter(c.IPRatePerMin, c.IPBurst)
+	h.tkLimit = newRateLimiter(c.TokenRatePerMin, c.TokenBurst)
+	h.dedup = newDeduper(c.DedupWindow)
 }
 
 // Close stops accepting new jobs and waits for in-flight signals to finish.
@@ -78,6 +94,10 @@ type WebhookRequest struct {
 	Price     string `json:"price"`
 	Price2    string `json:"price2"`
 
+	// Optional caller-supplied id; a repeat for the same token within the
+	// dedup window is ignored.
+	IdempotencyID string `json:"idempotency_id,omitempty"`
+
 	// Conditional close definitions (e.g. for TP/SL)
 	CloseOrderType string `json:"close_ordertype"`
 	ClosePrice     string `json:"close_price"`
@@ -94,9 +114,24 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if ok, wait := h.ipLimit.allow(clientIP(r, h.cfg.TrustProxy), h.now()); !ok {
+		tooMany(w, wait)
+		return
+	}
+
 	var req WebhookRequest
+	r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := req.validate(h.cfg.MaxVolume); err != nil {
+		http.Error(w, "Invalid signal: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -111,10 +146,23 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Only valid tokens reach here, so the per-token state stays bounded.
+	if ok, wait := h.tkLimit.allow(token, h.now()); !ok {
+		tooMany(w, wait)
+		return
+	}
+	key := dedupKey(token, req)
+	if !h.dedup.firstSeen(key, h.now()) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"duplicate"}`))
+		return
+	}
+
 	// Persist the signal before acknowledging: once TradingView gets a 2xx it
 	// never retries, so an in-memory-only signal would be lost on restart.
 	signalID, err := h.db.SaveSignal(conn.ID, req.Pair, req.Type, req)
 	if err != nil {
+		h.dedup.forget(key)
 		log.Printf("Failed to save signal for connection %d: %v", conn.ID, err)
 		http.Error(w, "Temporary server error, retry later", http.StatusServiceUnavailable)
 		return
@@ -126,9 +174,15 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 		w.Write([]byte(`{"status":"accepted"}`))
 	default:
+		h.dedup.forget(key)
 		log.Printf("Signal queue full, dropping signal for connection %d", conn.ID)
 		http.Error(w, "Server busy, try again", http.StatusServiceUnavailable)
 	}
+}
+
+func tooMany(w http.ResponseWriter, wait time.Duration) {
+	w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+	http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 }
 
 func (h *WebhookHandler) worker() {
@@ -221,7 +275,14 @@ func (h *WebhookHandler) processSignal(conn *database.Connection, req WebhookReq
 		orderInput.Close = closeParams
 	}
 
-	testMode := h.testMode || conn.TestMode
+	// Re-read the connection so a PATCH disabling live between enqueue and
+	// processing is honoured. Fail closed: on lookup error, validate only.
+	testMode := true
+	if fresh, err := h.db.GetConnectionByID(conn.ID); err != nil {
+		log.Printf("Failed to re-read connection %d before order, validating only: %v", conn.ID, err)
+	} else {
+		testMode = !shouldPlaceLive(h.testMode, fresh)
+	}
 	if testMode {
 		orderInput.Validate = true
 	}

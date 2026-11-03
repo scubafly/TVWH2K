@@ -218,7 +218,7 @@ func TestUpdateSetsTelegramSettings(t *testing.T) {
 
 	botEnc, _ := h.encryptor.Encrypt("bot-token")
 	updated := sqlmock.NewRows(connectionCols).AddRow(
-		int64(7), "user-1", "kraken", []byte("k"), []byte("s"), "tok", true, botEnc, int64(1234), time.Now())
+		int64(7), "user-1", "kraken", []byte("k"), []byte("s"), "tok", true, false, botEnc, int64(1234), time.Now())
 	mock.ExpectQuery("UPDATE connections SET telegram_bot_token_encrypted").
 		WillReturnRows(updated)
 
@@ -261,5 +261,118 @@ func TestUpdateSetsTestMode(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestShouldPlaceLive(t *testing.T) {
+	cases := []struct {
+		server, connTest, live, want bool
+	}{
+		{false, false, true, true},
+		{true, false, true, false},
+		{false, true, true, false},
+		{false, false, false, false},
+		{true, true, false, false},
+	}
+	for _, c := range cases {
+		got := shouldPlaceLive(c.server, &database.Connection{TestMode: c.connTest, LiveEnabled: c.live})
+		if got != c.want {
+			t.Errorf("server=%v connTest=%v live=%v: got %v want %v", c.server, c.connTest, c.live, got, c.want)
+		}
+	}
+}
+
+func TestCreateLiveRequiresConfirm(t *testing.T) {
+	db, _ := newMockDB(t)
+	h := newConnectionsHandlerForTest(t, db, "ok")
+	rec := httptest.NewRecorder()
+	h.Create(rec, authedRequest("POST", "/api/connections", `{"kraken_api_key":"k","kraken_api_secret":"s","live_enabled":true}`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without confirm_live, got %d", rec.Code)
+	}
+}
+
+func TestUpdateLiveRequiresConfirm(t *testing.T) {
+	db, mock := newMockDB(t)
+	h := newConnectionsHandlerForTest(t, db, "ok")
+	mock.ExpectQuery("SELECT").WillReturnRows(connectionRow(t, h.encryptor, 7, "tok", true))
+	rec := serve(h.Update, "PATCH /api/connections/{id}",
+		authedRequest("PATCH", "/api/connections/7", `{"live_enabled":true}`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without confirm_live, got %d", rec.Code)
+	}
+}
+
+func TestUpdateLiveWithConfirm(t *testing.T) {
+	db, mock := newMockDB(t)
+	h := newConnectionsHandlerForTest(t, db, "ok")
+	mock.ExpectQuery("SELECT").WillReturnRows(connectionRow(t, h.encryptor, 7, "tok", true))
+	mock.ExpectQuery("UPDATE connections SET live_enabled").
+		WillReturnRows(connectionRow(t, h.encryptor, 7, "tok", true))
+	rec := serve(h.Update, "PATCH /api/connections/{id}",
+		authedRequest("PATCH", "/api/connections/7", `{"live_enabled":true,"confirm_live":true}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUpdateTestModeOffOnLiveOptInRequiresConfirm(t *testing.T) {
+	newH := func(t *testing.T) (*ConnectionsHandler, sqlmock.Sqlmock) {
+		db, mock := newMockDB(t)
+		h := NewConnectionsHandler(db, newTestEncryptor(t), "https://api.example.com", false)
+		mock.ExpectQuery("SELECT (.+) FROM connections WHERE id").
+			WillReturnRows(connectionRowLive(t, h.encryptor, 7, "tok", true, true))
+		return h, mock
+	}
+
+	// effective_live false -> true via test_mode:false without confirm: 400.
+	h, mock := newH(t)
+	rec := serve(h.Update, "PATCH /api/connections/{id}",
+		authedRequest("PATCH", "/api/connections/7", `{"test_mode":false}`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without confirm_live, got %d", rec.Code)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+
+	// With confirm_live: allowed.
+	h, mock = newH(t)
+	mock.ExpectQuery("UPDATE connections SET test_mode").
+		WillReturnRows(connectionRowLive(t, h.encryptor, 7, "tok", false, true))
+	rec = serve(h.Update, "PATCH /api/connections/{id}",
+		authedRequest("PATCH", "/api/connections/7", `{"test_mode":false,"confirm_live":true}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with confirm_live, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUpdateMultipleFieldsSingleStatement(t *testing.T) {
+	db, mock := newMockDB(t)
+	h := NewConnectionsHandler(db, newTestEncryptor(t), "https://api.example.com", false)
+	mock.ExpectQuery("SELECT (.+) FROM connections WHERE id").WillReturnRows(connectionRow(t, h.encryptor, 7, "tok", true))
+	mock.ExpectQuery("UPDATE connections SET telegram_bot_token_encrypted = \\$3, telegram_chat_id = \\$4, test_mode = \\$5, live_enabled = \\$6").
+		WillReturnRows(connectionRow(t, h.encryptor, 7, "tok", false))
+	rec := serve(h.Update, "PATCH /api/connections/{id}",
+		authedRequest("PATCH", "/api/connections/7", `{"telegram_bot_token":"b","telegram_chat_id":5,"test_mode":false,"live_enabled":true,"confirm_live":true}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d: %s", rec.Code, rec.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestToResponseEffectiveLive(t *testing.T) {
+	h := &ConnectionsHandler{testMode: false, apiBaseURL: "x"}
+	if !h.toResponse(&database.Connection{LiveEnabled: true}).EffectiveLive {
+		t.Error("expected effective_live true")
+	}
+	if h.toResponse(&database.Connection{LiveEnabled: true, TestMode: true}).EffectiveLive {
+		t.Error("test_mode must make effective_live false")
+	}
+	h.testMode = true
+	if h.toResponse(&database.Connection{LiveEnabled: true}).EffectiveLive {
+		t.Error("server test mode must make effective_live false")
 	}
 }
