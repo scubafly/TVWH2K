@@ -40,7 +40,8 @@ type WebhookHandler struct {
 	newKraken func(apiKey, apiSecret string) (orderPlacer, error)
 
 	cfg     guardConfig
-	ipLimit *rateLimiter
+	lkLimit *rateLimiter // pre-lookup cap, every request
+	ipLimit *rateLimiter // strict, unknown tokens only
 	tkLimit *rateLimiter
 	dedup   *deduper
 	now     func() time.Time
@@ -73,6 +74,7 @@ func NewWebhookHandler(db *database.DB, encryptor *security.Encryptor, testMode 
 
 func (h *WebhookHandler) setGuardConfig(c guardConfig) {
 	h.cfg = c
+	h.lkLimit = newRateLimiter(c.LookupRatePerMin, c.LookupBurst)
 	h.ipLimit = newRateLimiter(c.IPRatePerMin, c.IPBurst)
 	h.tkLimit = newRateLimiter(c.TokenRatePerMin, c.TokenBurst)
 	h.dedup = newDeduper(c.DedupWindow)
@@ -132,12 +134,19 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ip := clientIP(r, h.cfg.TrustProxy, h.cfg.TrustedHops)
 
+	// Tier 1: generous per-IP cap on every request, taken before the DB lookup
+	// so a flood of garbage tokens cannot drive unbounded lookups. Set far above
+	// what TradingView can send from a shared IP.
+	if ok, wait := h.lkLimit.allow(ip, h.now()); !ok {
+		tooMany(w, wait)
+		return
+	}
+
 	conn, err := h.db.GetConnectionByWebhookToken(token)
 	if errors.Is(err, sql.ErrNoRows) {
-		// TradingView alerts come from a few shared IPs, so a plain per-IP
-		// limit would throttle every user. The IP limiter only counts failed
-		// token lookups and never blocks a valid token (those are limited per
-		// token, below), so guessing from a shared IP cannot lock out valid alerts.
+		// Tier 2: strict budget consumed only by unknown tokens. It is never
+		// checked before the lookup, so it cannot block valid tokens from a
+		// shared IP; it only turns the not-found reply into a 429.
 		if ok, wait := h.ipLimit.allow(ip, h.now()); !ok {
 			tooMany(w, wait)
 			return

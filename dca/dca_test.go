@@ -20,6 +20,7 @@ type fakeSource struct {
 	prices   map[string]float64
 	orderErr error
 	orders   []kraken.OrderInput
+	pairs    map[string]kraken.AssetPair // overrides fakePairs when set
 }
 
 var fakePairs = map[string]kraken.AssetPair{
@@ -29,9 +30,14 @@ var fakePairs = map[string]kraken.AssetPair{
 	"USDTZEUR": {Altname: "USDTEUR", WSName: "USDT/EUR", Base: "USDT", Quote: "ZEUR"},
 }
 
-func (f *fakeSource) Balances() (map[string]float64, error)            { return f.balances, nil }
-func (f *fakeSource) AssetPairs() (map[string]kraken.AssetPair, error) { return fakePairs, nil }
-func (f *fakeSource) Trades() ([]kraken.Trade, error)                  { return f.trades, nil }
+func (f *fakeSource) Balances() (map[string]float64, error) { return f.balances, nil }
+func (f *fakeSource) AssetPairs() (map[string]kraken.AssetPair, error) {
+	if f.pairs != nil {
+		return f.pairs, nil
+	}
+	return fakePairs, nil
+}
+func (f *fakeSource) Trades() ([]kraken.Trade, error) { return f.trades, nil }
 func (f *fakeSource) TickerPrice(pair string) (float64, error) {
 	p, ok := f.prices[pair]
 	if !ok {
@@ -514,5 +520,24 @@ func TestZeroVolumeSkipped(t *testing.T) {
 	s.RunOnce()
 	if len(f.orders) != 0 {
 		t.Fatalf("orders = %+v, want none", f.orders)
+	}
+}
+
+func TestBelowOrderMinSkipped(t *testing.T) {
+	f := btcSource(850) // 50/850 = 0.05882352 BTC
+	p := fakePairs["XXBTZEUR"]
+	p.OrderMin = "0.1"
+	f.pairs = map[string]kraken.AssetPair{"XXBTZEUR": p}
+	s, _ := newSvc(f, false)
+	if err := s.RunOnce(); err != nil || len(f.orders) != 0 {
+		t.Fatalf("err=%v orders=%d, want skip", err, len(f.orders))
+	}
+	if len(s.last) != 0 {
+		t.Fatal("skip must not set cooldown")
+	}
+	p.OrderMin = "0.05"
+	f.pairs["XXBTZEUR"] = p
+	if err := s.RunOnce(); err != nil || len(f.orders) != 1 {
+		t.Fatalf("err=%v orders=%d, want 1 order", err, len(f.orders))
 	}
 }

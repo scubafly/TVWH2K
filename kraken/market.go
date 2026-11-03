@@ -17,6 +17,8 @@ type AssetPair struct {
 	WSName  string `json:"wsname"`  // e.g. XBT/EUR
 	// LotDecimals is the volume precision; nil when not reported.
 	LotDecimals *int `json:"lot_decimals"`
+	// OrderMin is the minimum order volume as a string; empty when not reported.
+	OrderMin string `json:"ordermin"`
 }
 
 // TickerInfo is the subset of Ticker info we use.

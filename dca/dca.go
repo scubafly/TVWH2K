@@ -301,6 +301,7 @@ func (s *Service) RunOnce() error {
 		asset, pair     string
 		vol, price, val float64
 		lotDec          int
+		orderMin        string
 	}
 	var errs []error
 	var cands []cand
@@ -325,7 +326,7 @@ func (s *Service) RunOnce() error {
 		if vol*price < s.cfg.MinValueEUR {
 			continue // dust
 		}
-		cands = append(cands, cand{a, pair, vol, price, vol * price, lotDecimals(pairs[pair])})
+		cands = append(cands, cand{a, pair, vol, price, vol * price, lotDecimals(pairs[pair]), pairs[pair].OrderMin})
 	}
 
 	if len(cands) > 0 {
@@ -343,7 +344,7 @@ func (s *Service) RunOnce() error {
 			byPair[key] = append(byPair[key], t)
 		}
 		for _, c := range cands {
-			if err := s.handle(c.asset, c.pair, c.vol, c.price, c.lotDec, byPair[c.pair]); err != nil {
+			if err := s.handle(c.asset, c.pair, c.vol, c.price, c.lotDec, c.orderMin, byPair[c.pair]); err != nil {
 				log.Printf("DCA WARNING: %v", err)
 				errs = append(errs, err)
 			}
@@ -352,7 +353,7 @@ func (s *Service) RunOnce() error {
 	return errors.Join(errs...)
 }
 
-func (s *Service) handle(asset, pair string, balance, price float64, lotDec int, trades []kraken.Trade) error {
+func (s *Service) handle(asset, pair string, balance, price float64, lotDec int, orderMin string, trades []kraken.Trade) error {
 	id := asset + "/" + pair
 	vol, avg, ok, err := AverageCost(trades)
 	if err != nil {
@@ -389,6 +390,11 @@ func (s *Service) handle(asset, pair string, balance, price float64, lotDec int,
 	orderVol := roundDown(s.cfg.AmountEUR/price, lotDec)
 	if orderVol <= 0 {
 		log.Printf("DCA: skipping %s, amount %.2f buys zero volume at price %.4f (lot decimals %d)", id, s.cfg.AmountEUR, price, lotDec)
+		return nil
+	}
+
+	if minVol, err := strconv.ParseFloat(orderMin, 64); err == nil && minVol > 0 && orderVol < minVol {
+		log.Printf("DCA: skipping %s, volume %s below pair ordermin %s", id, strconv.FormatFloat(orderVol, 'f', lotDec, 64), orderMin)
 		return nil
 	}
 

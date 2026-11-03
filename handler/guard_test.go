@@ -362,3 +362,56 @@ func TestValidTokensNeverConsumeIPBudget(t *testing.T) {
 		}
 	}
 }
+
+func TestLookupCapBoundsDBLookupsFromOneIP(t *testing.T) {
+	cfg := defaultGuardConfig()
+	cfg.LookupBurst = 3
+	cfg.LookupRatePerMin = 1
+	h, mock := newGuardHandler(t, cfg)
+	h.now = func() time.Time { return time.Unix(1000, 0) }
+	for i := 0; i < 10; i++ {
+		if i < 3 {
+			mock.ExpectQuery("SELECT (.+) FROM connections WHERE webhook_token").
+				WillReturnError(sql.ErrNoRows)
+		}
+		rec := postWebhook(h, "garbage"+strconv.Itoa(i), `{"text":"x"}`)
+		want := http.StatusUnauthorized
+		if i >= 3 {
+			want = http.StatusTooManyRequests
+			if rec.Header().Get("Retry-After") == "" {
+				t.Error("missing Retry-After")
+			}
+		}
+		if rec.Code != want {
+			t.Fatalf("req %d: expected %d, got %d", i, want, rec.Code)
+		}
+	}
+	// Exactly 3 lookups hit the store; any further query would have failed above.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSharedIPValidTokenSurvivesStrictBudgetExhaustion(t *testing.T) {
+	cfg := defaultGuardConfig()
+	cfg.IPBurst = 2
+	cfg.IPRatePerMin = 1
+	h, mock := newGuardHandler(t, cfg)
+	h.now = func() time.Time { return time.Unix(1000, 0) }
+	for i := 0; i < 5; i++ {
+		mock.ExpectQuery("SELECT (.+) FROM connections WHERE webhook_token").
+			WillReturnError(sql.ErrNoRows)
+		rec := postWebhook(h, "garbage"+strconv.Itoa(i), `{"text":"x"}`)
+		want := http.StatusUnauthorized
+		if i >= 2 {
+			want = http.StatusTooManyRequests
+		}
+		if rec.Code != want {
+			t.Fatalf("garbage %d: expected %d, got %d", i, want, rec.Code)
+		}
+	}
+	expectAccepted(t, mock, h, 1)
+	if rec := postWebhook(h, "tok", `{"text":"hi"}`); rec.Code != http.StatusAccepted {
+		t.Fatalf("valid token from shared IP: expected 202, got %d", rec.Code)
+	}
+}

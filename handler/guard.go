@@ -20,27 +20,31 @@ import (
 // guardConfig holds the webhook hardening knobs (see README "Webhook
 // hardening"). All values come from env vars with safe defaults.
 type guardConfig struct {
-	TokenRatePerMin float64       // WEBHOOK_TOKEN_RATE_PER_MIN
-	TokenBurst      int           // WEBHOOK_TOKEN_BURST
-	IPRatePerMin    float64       // WEBHOOK_IP_RATE_PER_MIN
-	IPBurst         int           // WEBHOOK_IP_BURST
-	DedupWindow     time.Duration // WEBHOOK_DEDUP_WINDOW (0 disables)
-	MaxBodyBytes    int64         // WEBHOOK_MAX_BODY_BYTES
-	MaxVolume       float64       // WEBHOOK_MAX_VOLUME
-	TrustProxy      bool          // WEBHOOK_TRUST_PROXY: derive client IP from CF-Connecting-IP / X-Forwarded-For
-	TrustedHops     int           // WEBHOOK_TRUSTED_HOPS: proxies appending to X-Forwarded-For (default 2)
+	TokenRatePerMin  float64       // WEBHOOK_TOKEN_RATE_PER_MIN
+	TokenBurst       int           // WEBHOOK_TOKEN_BURST
+	LookupRatePerMin float64       // WEBHOOK_IP_LOOKUP_RATE_PER_MIN: pre-lookup per-IP cap on all requests
+	LookupBurst      int           // WEBHOOK_IP_LOOKUP_BURST
+	IPRatePerMin     float64       // WEBHOOK_IP_RATE_PER_MIN: strict per-IP budget for unknown tokens only
+	IPBurst          int           // WEBHOOK_IP_BURST
+	DedupWindow      time.Duration // WEBHOOK_DEDUP_WINDOW (0 disables)
+	MaxBodyBytes     int64         // WEBHOOK_MAX_BODY_BYTES
+	MaxVolume        float64       // WEBHOOK_MAX_VOLUME
+	TrustProxy       bool          // WEBHOOK_TRUST_PROXY: derive client IP from CF-Connecting-IP / X-Forwarded-For
+	TrustedHops      int           // WEBHOOK_TRUSTED_HOPS: proxies appending to X-Forwarded-For (default 2)
 }
 
 func defaultGuardConfig() guardConfig {
 	return guardConfig{
-		TokenRatePerMin: 30,
-		TokenBurst:      10,
-		IPRatePerMin:    120,
-		IPBurst:         30,
-		DedupWindow:     60 * time.Second,
-		MaxBodyBytes:    16 * 1024,
-		MaxVolume:       1000000,
-		TrustedHops:     2,
+		TokenRatePerMin:  30,
+		TokenBurst:       10,
+		LookupRatePerMin: 300,
+		LookupBurst:      150,
+		IPRatePerMin:     120,
+		IPBurst:          30,
+		DedupWindow:      60 * time.Second,
+		MaxBodyBytes:     16 * 1024,
+		MaxVolume:        1000000,
+		TrustedHops:      2,
 	}
 }
 
@@ -68,6 +72,8 @@ func guardConfigFromEnv() guardConfig {
 	}
 	envFloat("WEBHOOK_TOKEN_RATE_PER_MIN", &c.TokenRatePerMin)
 	envInt("WEBHOOK_TOKEN_BURST", &c.TokenBurst)
+	envFloat("WEBHOOK_IP_LOOKUP_RATE_PER_MIN", &c.LookupRatePerMin)
+	envInt("WEBHOOK_IP_LOOKUP_BURST", &c.LookupBurst)
 	envFloat("WEBHOOK_IP_RATE_PER_MIN", &c.IPRatePerMin)
 	envInt("WEBHOOK_IP_BURST", &c.IPBurst)
 	envFloat("WEBHOOK_MAX_VOLUME", &c.MaxVolume)

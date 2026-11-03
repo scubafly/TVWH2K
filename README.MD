@@ -55,6 +55,7 @@ Safety: any `AddOrder` error that is not a clear Kraken rejection (timeout, tran
 | Env var | Default | Effect |
 |---|---|---|
 | `WEBHOOK_TOKEN_RATE_PER_MIN` / `WEBHOOK_TOKEN_BURST` | `30` / `10` | per-token token bucket, 429 + `Retry-After` when empty |
+| `WEBHOOK_IP_LOOKUP_RATE_PER_MIN` / `WEBHOOK_IP_LOOKUP_BURST` | `300` / `150` | per-client-IP cap on every webhook request, taken before the token DB lookup; bounds lookups per IP (set far above what TradingView sends from a shared IP); over cap returns 429 |
 | `WEBHOOK_IP_RATE_PER_MIN` / `WEBHOOK_IP_BURST` | `120` / `30` | per-client-IP bucket counting only failed token lookups (valid tokens use the per-token limit); once exhausted, unknown tokens from that IP get 429 until it refills, valid tokens are unaffected |
 | `WEBHOOK_DEDUP_WINDOW` | `60s` | identical payload (or same optional `idempotency_id`) for the same token inside the window returns 200 `{"status":"duplicate"}` and is not enqueued; `0` disables |
 | `WEBHOOK_MAX_BODY_BYTES` | `16384` | larger bodies get 413 |
