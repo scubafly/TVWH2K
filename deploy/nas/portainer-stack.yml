@@ -20,11 +20,14 @@
 #                      caddy-data, caddy-config; create + chown first, see guide)
 #   API_IMAGE          ghcr.io/scubafly/tvwh2k:latest  (or tvwh2k:local, see guide)
 #   POSTGRES_DB        tvwh2k
-#   GOTRUE_DISABLE_SIGNUP  false  -> set to true AFTER you created your account, redeploy
-#   GOTRUE_MAILER_AUTOCONFIRM  true (false needs SMTP_*)
+#   GOTRUE_DISABLE_SIGNUP  true (default, closed). To create the operator account deploy
+#                      once with false (+ GOTRUE_MAILER_AUTOCONFIRM=true if no SMTP yet), sign
+#                      up, then redeploy with the defaults. See PORTAINER-GUIDE.md section 7.
+#   GOTRUE_MAILER_AUTOCONFIRM  false (default; needs SMTP_* for confirmation mails)
 #   SMTP_HOST (e.g. smtp.gmail.com) SMTP_PORT (587) SMTP_USER SMTP_PASS (Gmail
 #   app password) SMTP_ADMIN_EMAIL SMTP_SENDER_NAME
-#   WEBHOOK_TRUST_PROXY  true
+#   WEBHOOK_TRUST_PROXY  true (uses CF-Connecting-IP, else X-Forwarded-For)
+#   WEBHOOK_TRUSTED_HOPS 2 (proxies appending to X-Forwarded-For: cloudflared->caddy)
 #   BACKUP_RETENTION_DAYS  14
 # KRAKEN_TEST_MODE is deliberately hard-coded to true below (no live orders).
 #
@@ -76,9 +79,9 @@ services:
       GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
       GOTRUE_JWT_EXP: "3600"
       # false = anyone can sign up. Create your account, then set true and redeploy.
-      GOTRUE_DISABLE_SIGNUP: "${GOTRUE_DISABLE_SIGNUP:-false}"
+      GOTRUE_DISABLE_SIGNUP: "${GOTRUE_DISABLE_SIGNUP:-true}"
       GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
-      GOTRUE_MAILER_AUTOCONFIRM: "${GOTRUE_MAILER_AUTOCONFIRM:-true}"
+      GOTRUE_MAILER_AUTOCONFIRM: "${GOTRUE_MAILER_AUTOCONFIRM:-false}"
       GOTRUE_SMTP_HOST: "${SMTP_HOST:-}"
       GOTRUE_SMTP_PORT: "${SMTP_PORT:-587}"
       GOTRUE_SMTP_USER: "${SMTP_USER:-}"
@@ -129,6 +132,7 @@ services:
       FRONTEND_ORIGIN: "${SITE_URL}"
       KRAKEN_TEST_MODE: "true"
       WEBHOOK_TRUST_PROXY: "${WEBHOOK_TRUST_PROXY:-true}"
+      WEBHOOK_TRUSTED_HOPS: "${WEBHOOK_TRUSTED_HOPS:-2}"
       PORT: "8081"
     networks: [internal]
     restart: unless-stopped
@@ -185,6 +189,11 @@ configs:
     content: |
       {
       	auto_https off
+      	# Trust only private ranges (cloudflared): keep its X-Forwarded-For and
+      	# pass CF-Connecting-IP through. Chain: client, cloudflared => WEBHOOK_TRUSTED_HOPS=2.
+      	servers {
+      		trusted_proxies static private_ranges
+      	}
       }
       # GoTrue serves at root; supabase-js calls <url>/auth/v1/*, so strip it.
       http://${AUTH_HOST} {
@@ -220,6 +229,8 @@ configs:
         END IF;
       END $$$$;
 
+  # Fresh DB only: for a DB you migrated by hand (or an older schema) compare
+  # first. Policies are dropped and recreated, so re-running is idempotent.
   sql_0001:
     content: |
       CREATE TABLE IF NOT EXISTS connections (
@@ -266,10 +277,13 @@ configs:
       ALTER TABLE signals ENABLE ROW LEVEL SECURITY;
       ALTER TABLE trades ENABLE ROW LEVEL SECURITY;
 
+      DROP POLICY IF EXISTS connections_owner_only ON connections;
       CREATE POLICY connections_owner_only ON connections
           USING (user_id = auth.uid());
+      DROP POLICY IF EXISTS signals_owner_only ON signals;
       CREATE POLICY signals_owner_only ON signals
           USING (connection_id IN (SELECT id FROM connections WHERE user_id = auth.uid()));
+      DROP POLICY IF EXISTS trades_owner_only ON trades;
       CREATE POLICY trades_owner_only ON trades
           USING (connection_id IN (SELECT id FROM connections WHERE user_id = auth.uid()));
 
@@ -304,8 +318,9 @@ configs:
   backup_script:
     content: |
       while true; do
+        umask 077
         out="/backups/$${PGDATABASE}_$$(date +%Y%m%d_%H%M%S).dump"
-        if pg_dump -Fc -f "$$out.partial"; then mv "$$out.partial" "$$out"; echo "backup $$out"; else echo "backup FAILED"; rm -f "$$out.partial"; fi
+        if pg_dump -Fc -f "$$out.partial"; then chmod 600 "$$out.partial"; mv "$$out.partial" "$$out"; echo "backup $$out"; else echo "backup FAILED"; rm -f "$$out.partial"; fi
         find /backups -name "$${PGDATABASE}_*.dump" -mtime +"$${KEEP_DAYS}" -delete
         sleep 86400
       done

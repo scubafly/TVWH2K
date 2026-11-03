@@ -33,18 +33,21 @@ PORT=8081
 ```
 
 ## DCA runner (optional, own account)
-Off by default; does not touch the webhook. Averages down losing **spot** holdings (no margin) by buying `DCA_AMOUNT_EUR` of the EUR pair when unrealized PnL is below the threshold. Positions come from account balances; cost basis is the volume-weighted average entry from trade history (average-cost: sells reduce volume at the average cost, buy fees count as cost). EUR, stablecoins, staked assets and dust below `DCA_MIN_VALUE_EUR` are skipped, as is any asset whose balance exceeds the trade-history volume (deposits/transfers: unknown basis). Orders are validate-only while `KRAKEN_TEST_MODE` is not `false`.
+Off by default; does not touch the webhook. Averages down losing **spot** holdings (no margin) by buying `DCA_AMOUNT_EUR` of the EUR pair when unrealized PnL is below the threshold. Positions come from account balances; cost basis is the volume-weighted average entry from trade history (average-cost: sells reduce volume at the average cost, buy fees count as cost). EUR, stablecoins, staked assets and dust below `DCA_MIN_VALUE_EUR` are skipped, as is any asset whose balance exceeds the trade-history volume (deposits/transfers: unknown basis). Orders are validate-only unless `KRAKEN_TEST_MODE=false` and `DCA_LIVE=true`. Margin trades (margin amount or position status set) are ignored for the cost basis; trades are de-duplicated by txid. Without a loaded `DCA_STATE_FILE` the first check happens one interval after start.
 
-Known limitations: the cooldown is in-memory (lost on restart, so a restart can trigger another buy); overlaps with tribot `cmd/portfolio`, which already does spot DCA, so do not run both on the same account.
+Safety: any `AddOrder` error that is not a clear Kraken rejection (timeout, transport error, non-2xx, `EService:*`) is treated as possibly placed, so the cooldown and daily spend are recorded and no duplicate is sent; the order carries a deterministic `userref` (hash of position + UTC day) to find it on Kraken. Spend per UTC day is capped by `DCA_MAX_DAILY_EUR`. Known limitations: the cooldown and daily spend are in-memory unless `DCA_STATE_FILE` is set (otherwise a restart can trigger another buy); overlaps with tribot `cmd/portfolio`, which already does spot DCA, so do not run both on the same account.
 
 | Env var | Default | Effect |
 |---|---|---|
 | `DCA_ENABLED` | `false` | set `true` to start the runner (needs `KRAKEN_API_KEY`, `KRAKEN_API_SECRET`) |
-| `DCA_THRESHOLD` | `-10.0` | PnL % below which a buy triggers |
+| `DCA_THRESHOLD` | `-10.0` | PnL % below which a buy triggers; must be < 0 or the runner refuses to start |
+| `DCA_LIVE` | `false` | live orders are only placed when `KRAKEN_TEST_MODE=false` AND `DCA_LIVE=true`; otherwise validate-only |
 | `DCA_AMOUNT_EUR` | required | quote amount per DCA buy (EUR pairs only) |
 | `DCA_COOLDOWN_HOURS` | `24` | min hours between DCA buys per position |
 | `DCA_MIN_VALUE_EUR` | `5` | holdings worth less are ignored as dust |
 | `DCA_INTERVAL_MINUTES` | `5` | check interval |
+| `DCA_MAX_DAILY_EUR` | `3 x DCA_AMOUNT_EUR` | max quote amount placed per UTC day (also counts possibly-placed orders); `0` disables |
+| `DCA_STATE_FILE` | empty | JSON file (mode 600, atomic write) persisting last-DCA times and daily spend across restarts; empty = memory only |
 
 ## Webhook hardening
 `POST /webhooks/{token}` is protected by (all env vars optional):
@@ -52,11 +55,12 @@ Known limitations: the cooldown is in-memory (lost on restart, so a restart can 
 | Env var | Default | Effect |
 |---|---|---|
 | `WEBHOOK_TOKEN_RATE_PER_MIN` / `WEBHOOK_TOKEN_BURST` | `30` / `10` | per-token token bucket, 429 + `Retry-After` when empty |
-| `WEBHOOK_IP_RATE_PER_MIN` / `WEBHOOK_IP_BURST` | `120` / `30` | per-client-IP token bucket |
+| `WEBHOOK_IP_RATE_PER_MIN` / `WEBHOOK_IP_BURST` | `120` / `30` | per-client-IP bucket counting only unknown-token requests (valid tokens use the per-token limit) |
 | `WEBHOOK_DEDUP_WINDOW` | `60s` | identical payload (or same optional `idempotency_id`) for the same token inside the window returns 200 `{"status":"duplicate"}` and is not enqueued; `0` disables |
 | `WEBHOOK_MAX_BODY_BYTES` | `16384` | larger bodies get 413 |
 | `WEBHOOK_MAX_VOLUME` | `1000000` | volume must be a plain decimal, > 0 and <= this, else 400 |
-| `WEBHOOK_TRUST_PROXY` | `false` | when `true`, client IP is the last `X-Forwarded-For` hop (only behind a trusted proxy) |
+| `WEBHOOK_TRUST_PROXY` | `false` | when `true`, client IP is `CF-Connecting-IP` (if a valid IP), else the `WEBHOOK_TRUSTED_HOPS`-th `X-Forwarded-For` entry from the right, else the socket address. Only enable when the API is reachable solely through the trusted proxy chain |
+| `WEBHOOK_TRUSTED_HOPS` | `2` | number of proxies appending to `X-Forwarded-For` (1 = right-most entry). Cloudflare tunnel -> caddy -> api is 2; the bundled Caddyfile trusts private ranges only so client-sent headers cannot be spoofed past cloudflared |
 
 Signals are validated: `type` must be buy/sell, `pair` alphanumeric (optionally `BASE/QUOTE`), `ordertype` a known Kraken type, price fields numeric; payloads without pair/type/volume are accepted as text-only notifications. Limits are in-memory and per process.
 

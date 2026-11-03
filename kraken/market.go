@@ -111,6 +111,45 @@ type Trade struct {
 	Cost  string  `json:"cost"` // total quote amount, excluding fee
 	Fee   string  `json:"fee"`  // fee in quote currency
 	Vol   string  `json:"vol"`  // base volume
+
+	// Margin trades carry a margin amount and/or a position status; they are
+	// not spot and must not feed the spot cost basis.
+	Margin    flexString `json:"margin"`
+	PosStatus string     `json:"posstatus"`
+}
+
+// IsMargin reports whether the trade is a margin trade.
+func (t Trade) IsMargin() bool {
+	if t.PosStatus != "" {
+		return true
+	}
+	m := strings.TrimSpace(string(t.Margin))
+	if m == "" {
+		return false
+	}
+	f, err := strconv.ParseFloat(m, 64)
+	return err != nil || f != 0
+}
+
+// flexString accepts a JSON string or number.
+type flexString string
+
+func (f *flexString) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "null" {
+		*f = ""
+		return nil
+	}
+	if len(s) > 0 && s[0] == '"' {
+		var v string
+		if err := json.Unmarshal(b, &v); err != nil {
+			return err
+		}
+		*f = flexString(v)
+		return nil
+	}
+	*f = flexString(s)
+	return nil
 }
 
 const maxTradeHistoryPages = 1000
@@ -119,9 +158,11 @@ const maxTradeHistoryPages = 1000
 // via ofs, sorted oldest first.
 func (k *Kraken) GetTradesHistory() ([]Trade, error) {
 	var all []Trade
+	seen := map[string]bool{}
+	fetched := 0 // raw entries received, the ofs offset Kraken expects
 	for page := 0; page < maxTradeHistoryPages; page++ {
 		params := url.Values{}
-		params.Set("ofs", strconv.Itoa(len(all)))
+		params.Set("ofs", strconv.Itoa(fetched))
 		body, err := k.doRequest("POST", krakenPrivatePathPrefix+"TradesHistory", params)
 		if err != nil {
 			return nil, fmt.Errorf("kraken request for TradesHistory failed: %w", err)
@@ -137,10 +178,15 @@ func (k *Kraken) GetTradesHistory() ([]Trade, error) {
 			break
 		}
 		for id, t := range res.Trades {
+			fetched++
+			if seen[id] {
+				continue // duplicated across pages (history shifted while paging)
+			}
+			seen[id] = true
 			t.ID = id
 			all = append(all, t)
 		}
-		if len(all) >= res.Count {
+		if fetched >= res.Count {
 			break
 		}
 	}

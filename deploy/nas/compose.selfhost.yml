@@ -45,9 +45,11 @@ services:
       GOTRUE_JWT_AUD: authenticated
       GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
       GOTRUE_JWT_EXP: "3600"
-      GOTRUE_DISABLE_SIGNUP: "false"
+      # Closed by default. For the first account run once with GOTRUE_DISABLE_SIGNUP=false
+      # (and GOTRUE_MAILER_AUTOCONFIRM=true without SMTP), sign up, then restore defaults.
+      GOTRUE_DISABLE_SIGNUP: "${GOTRUE_DISABLE_SIGNUP:-true}"
       GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
-      GOTRUE_MAILER_AUTOCONFIRM: "${GOTRUE_MAILER_AUTOCONFIRM:-true}"
+      GOTRUE_MAILER_AUTOCONFIRM: "${GOTRUE_MAILER_AUTOCONFIRM:-false}"
       # SMTP only needed when autoconfirm=false.
       GOTRUE_SMTP_HOST: "${SMTP_HOST:-}"
       GOTRUE_SMTP_PORT: "${SMTP_PORT:-587}"
@@ -72,6 +74,7 @@ services:
       KRAKEN_TEST_MODE: "${KRAKEN_TEST_MODE:-true}"
       # Behind Caddy/Cloudflare: trust proxy headers for client IP.
       WEBHOOK_TRUST_PROXY: "${WEBHOOK_TRUST_PROXY:-true}"
+      WEBHOOK_TRUSTED_HOPS: "${WEBHOOK_TRUSTED_HOPS:-2}"
       PORT: "8081"
     networks: [internal]
     restart: unless-stopped

@@ -11,17 +11,23 @@
 //     assets and dust below DCA_MIN_VALUE_EUR are skipped.
 //   - If the balance exceeds the volume derived from trade history (deposits,
 //     transfers, airdrops) the basis is unknown and the asset is skipped.
-//   - The cooldown map is in-memory and lost on restart.
+//   - The cooldown map and daily spend are in-memory unless DCA_STATE_FILE is set.
+//   - An order whose outcome is unknown (transport error/timeout, ambiguous
+//     EService error) is treated as placed: cooldown and daily spend are
+//     recorded so no duplicate live order follows; check Kraken manually.
 //   - Overlaps with tribot cmd/portfolio, which already does spot DCA.
 package dca
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,6 +55,8 @@ type Config struct {
 	Cooldown    time.Duration // minimum time between DCA buys per position
 	MinValueEUR float64       // holdings worth less than this are dust and skipped
 	TestMode    bool          // true: orders are validate-only
+	MaxDailyEUR float64       // max quote amount placed per UTC day; 0 disables
+	StateFile   string        // optional JSON file persisting cooldown + daily spend; "" = memory only
 }
 
 // Service runs the DCA logic.
@@ -57,12 +65,120 @@ type Service struct {
 	cfg  Config
 	now  func() time.Time
 	mu   sync.Mutex
-	last map[string]time.Time // position id -> last successful DCA
+	last map[string]time.Time // position id -> last (possibly) placed DCA
+
+	stateLoaded bool // a state file existed and parsed at startup
+
+	spentDay string  // UTC day (2006-01-02) that spent refers to
+	spent    float64 // quote amount placed on spentDay
 }
 
-// New creates a Service.
+// New creates a Service. If cfg.StateFile is set and exists it is loaded; a
+// corrupt file is logged and ignored (starts empty).
 func New(src Source, cfg Config) *Service {
-	return &Service{src: src, cfg: cfg, now: time.Now, last: make(map[string]time.Time)}
+	s := &Service{src: src, cfg: cfg, now: time.Now, last: make(map[string]time.Time)}
+	if cfg.StateFile != "" {
+		if err := s.loadState(); err != nil {
+			log.Printf("DCA WARNING: cannot load state file %s: %v", cfg.StateFile, err)
+		}
+	}
+	return s
+}
+
+type stateFile struct {
+	Last     map[string]time.Time `json:"last"`
+	SpentDay string               `json:"spent_day"`
+	Spent    float64              `json:"spent"`
+}
+
+func (s *Service) loadState() error {
+	b, err := os.ReadFile(s.cfg.StateFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // first start: nothing loaded, Run waits one interval
+	}
+	if err != nil {
+		return err
+	}
+	var st stateFile
+	if err := json.Unmarshal(b, &st); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, v := range st.Last {
+		s.last[k] = v
+	}
+	s.spentDay, s.spent = st.SpentDay, st.Spent
+	s.stateLoaded = true
+	return nil
+}
+
+// saveState writes the state atomically (temp file + rename) with mode 600.
+// Caller must not hold s.mu.
+func (s *Service) saveState() error {
+	if s.cfg.StateFile == "" {
+		return nil
+	}
+	s.mu.Lock()
+	st := stateFile{Last: make(map[string]time.Time, len(s.last)), SpentDay: s.spentDay, Spent: s.spent}
+	for k, v := range s.last {
+		st.Last[k] = v
+	}
+	s.mu.Unlock()
+	b, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(s.cfg.StateFile), ".dca-state-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // no-op after successful rename
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), s.cfg.StateFile)
+}
+
+// spentToday returns the amount placed on the current UTC day. Caller holds s.mu.
+func (s *Service) spentToday() float64 {
+	if day := s.now().UTC().Format("2006-01-02"); day != s.spentDay {
+		s.spentDay, s.spent = day, 0
+	}
+	return s.spent
+}
+
+// definiteRejection reports whether err is a clear Kraken API rejection, i.e.
+// the order certainly was not placed. Transport errors, timeouts, non-2xx
+// responses, unparsable bodies and ambiguous EService errors (Busy, Timeout,
+// Unavailable) may have left a live order and are NOT definite.
+func definiteRejection(err error) bool {
+	var ae *kraken.APIError
+	if !errors.As(err, &ae) || len(ae.Messages) == 0 {
+		return false
+	}
+	for _, m := range ae.Messages {
+		if strings.HasPrefix(m, "EService:") {
+			return false
+		}
+	}
+	return true
+}
+
+// userRef derives a deterministic positive int32 reference for a position and
+// UTC day, so a possible duplicate can be found in Kraken's order list.
+func userRef(id string, now time.Time) string {
+	h := fnv.New32a()
+	h.Write([]byte(id + "|" + now.UTC().Format("2006-01-02")))
+	return strconv.FormatInt(int64(h.Sum32()&0x7fffffff), 10)
 }
 
 // Position is a spot holding with its derived cost basis.
@@ -93,6 +209,9 @@ func AverageCost(trades []kraken.Trade) (vol, avg float64, ok bool, err error) {
 	var cost float64
 	ok = true
 	for _, t := range trades {
+		if t.IsMargin() {
+			continue // margin trades are not spot holdings
+		}
 		v, e1 := strconv.ParseFloat(t.Vol, 64)
 		c, e2 := strconv.ParseFloat(t.Cost, 64)
 		f, e3 := strconv.ParseFloat(t.Fee, 64)
@@ -235,7 +354,16 @@ func (s *Service) handle(asset, pair string, balance, price float64, trades []kr
 		return nil
 	}
 
+	s.mu.Lock()
+	over := s.cfg.MaxDailyEUR > 0 && s.spentToday()+s.cfg.AmountEUR > s.cfg.MaxDailyEUR
+	s.mu.Unlock()
+	if over {
+		log.Printf("DCA: skipping %s, daily cap DCA_MAX_DAILY_EUR %.2f reached", id, s.cfg.MaxDailyEUR)
+		return nil
+	}
+
 	order := kraken.OrderInput{
+		UserRef:   userRef(id, s.now()),
 		Pair:      pair,
 		Type:      "buy",
 		OrderType: "market",
@@ -243,13 +371,23 @@ func (s *Service) handle(asset, pair string, balance, price float64, trades []kr
 		Validate:  s.cfg.TestMode,
 	}
 	resp, err := s.src.PlaceOrder(order)
-	if err != nil {
-		// No cooldown on failure so the next tick retries.
-		return fmt.Errorf("position %s: DCA order failed: %w", id, err)
+	if err != nil && definiteRejection(err) {
+		// Kraken clearly refused: nothing was placed, so the next tick may retry.
+		return fmt.Errorf("position %s: DCA order rejected: %w", id, err)
 	}
+	// Success or unknown outcome (transport error/timeout may have reached
+	// Kraken): treat as placed to avoid a duplicate live order.
 	s.mu.Lock()
 	s.last[id] = s.now()
+	s.spentToday()
+	s.spent += s.cfg.AmountEUR
 	s.mu.Unlock()
+	if serr := s.saveState(); serr != nil {
+		log.Printf("DCA WARNING: cannot save state: %v", serr)
+	}
+	if err != nil {
+		return fmt.Errorf("position %s: DCA order outcome unknown, cooldown set, verify on Kraken (userref %s): %w", id, order.UserRef, err)
+	}
 	log.Printf("DCA: position %s avg entry %.4f price %.4f pnl %.2f%% < %.2f%%, placed buy %s (validate=%t): %s",
 		id, avg, price, pnl, s.cfg.Threshold, order.Volume, s.cfg.TestMode, resp.Description.Order)
 	return nil
@@ -259,6 +397,19 @@ func (s *Service) handle(asset, pair string, balance, price float64, trades []kr
 func (s *Service) Run(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	// Without a successfully loaded state file the cooldown/daily spend are
+	// unknown after a (re)start, so wait one interval before the first run.
+	s.mu.Lock()
+	immediate := s.stateLoaded
+	s.mu.Unlock()
+	if !immediate {
+		log.Printf("DCA: no state loaded, first run after %s", interval)
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 	for {
 		if err := s.RunOnce(); err != nil {
 			log.Printf("DCA run finished with errors: %v", err)
@@ -275,11 +426,15 @@ func (s *Service) Run(ctx context.Context, interval time.Duration) {
 func Enabled() bool { return os.Getenv("DCA_ENABLED") == "true" }
 
 // ConfigFromEnv reads DCA_THRESHOLD, DCA_AMOUNT_EUR, DCA_COOLDOWN_HOURS,
-// DCA_MIN_VALUE_EUR and KRAKEN_TEST_MODE, plus the run interval from DCA_INTERVAL_MINUTES.
+// DCA_MIN_VALUE_EUR, DCA_MAX_DAILY_EUR (default 3x DCA_AMOUNT_EUR, 0 disables),
+// DCA_STATE_FILE, KRAKEN_TEST_MODE and DCA_LIVE, plus the run interval from DCA_INTERVAL_MINUTES.
 func ConfigFromEnv() (Config, time.Duration, error) {
 	threshold, err := envFloat("DCA_THRESHOLD", -10.0)
 	if err != nil {
 		return Config{}, 0, err
+	}
+	if threshold >= 0 {
+		return Config{}, 0, fmt.Errorf("DCA_THRESHOLD must be < 0 (got %v): a non-negative threshold would buy on gains", threshold)
 	}
 	amount, err := envFloat("DCA_AMOUNT_EUR", 0)
 	if err != nil {
@@ -296,6 +451,13 @@ func ConfigFromEnv() (Config, time.Duration, error) {
 	if err != nil {
 		return Config{}, 0, err
 	}
+	maxDaily, err := envFloat("DCA_MAX_DAILY_EUR", amount*3)
+	if err != nil {
+		return Config{}, 0, err
+	}
+	if maxDaily < 0 {
+		return Config{}, 0, fmt.Errorf("DCA_MAX_DAILY_EUR must be >= 0")
+	}
 	mins, err := envFloat("DCA_INTERVAL_MINUTES", 5)
 	if err != nil {
 		return Config{}, 0, err
@@ -308,7 +470,10 @@ func ConfigFromEnv() (Config, time.Duration, error) {
 		AmountEUR:   amount,
 		Cooldown:    time.Duration(hours * float64(time.Hour)),
 		MinValueEUR: minVal,
-		TestMode:    os.Getenv("KRAKEN_TEST_MODE") != "false",
+		MaxDailyEUR: maxDaily,
+		StateFile:   os.Getenv("DCA_STATE_FILE"),
+		// Live orders need BOTH switches; anything else is validate-only.
+		TestMode: !(os.Getenv("KRAKEN_TEST_MODE") == "false" && os.Getenv("DCA_LIVE") == "true"),
 	}, time.Duration(mins * float64(time.Minute)), nil
 }
 

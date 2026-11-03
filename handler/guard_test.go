@@ -1,8 +1,10 @@
 package handler
 
 import (
+	"database/sql"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -77,10 +79,10 @@ func TestClientIP(t *testing.T) {
 	r := httptest.NewRequest("POST", "/", nil)
 	r.RemoteAddr = "1.2.3.4:5555"
 	r.Header.Set("X-Forwarded-For", "9.9.9.9, 5.6.7.8")
-	if got := clientIP(r, false); got != "1.2.3.4" {
+	if got := clientIP(r, false, 1); got != "1.2.3.4" {
 		t.Errorf("untrusted: %s", got)
 	}
-	if got := clientIP(r, true); got != "5.6.7.8" {
+	if got := clientIP(r, true, 1); got != "5.6.7.8" {
 		t.Errorf("trusted: %s", got)
 	}
 }
@@ -230,7 +232,6 @@ func TestWebhookRateLimit(t *testing.T) {
 		tweak func(*guardConfig)
 	}{
 		{"per token", func(c *guardConfig) { c.TokenBurst = 2; c.TokenRatePerMin = 1 }},
-		{"per ip", func(c *guardConfig) { c.IPBurst = 2; c.IPRatePerMin = 1 }},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -261,13 +262,13 @@ func TestClientIPInvalidXFFAndIPv6(t *testing.T) {
 	r := httptest.NewRequest("POST", "/", nil)
 	r.RemoteAddr = "1.2.3.4:5555"
 	r.Header.Set("X-Forwarded-For", "9.9.9.9, garbage")
-	if got := clientIP(r, true); got != "1.2.3.4" {
+	if got := clientIP(r, true, 1); got != "1.2.3.4" {
 		t.Errorf("invalid XFF should fall back to RemoteAddr, got %s", got)
 	}
 	r.RemoteAddr = "[2001:db8:1:2:aaaa:bbbb:cccc:dddd]:80"
-	a := clientIP(r, false)
+	a := clientIP(r, false, 1)
 	r.RemoteAddr = "[2001:db8:1:2:1111:2222:3333:4444]:80"
-	if b := clientIP(r, false); a != b {
+	if b := clientIP(r, false, 1); a != b {
 		t.Errorf("same /64 should share key: %s vs %s", a, b)
 	}
 }
@@ -279,5 +280,85 @@ func TestValidateNormalizesCloseOrderType(t *testing.T) {
 	}
 	if req.CloseOrderType != "limit" || req.ClosePrice != "5" {
 		t.Errorf("not normalized: %q %q", req.CloseOrderType, req.ClosePrice)
+	}
+}
+
+func TestClientIPTrustedHops(t *testing.T) {
+	tests := []struct {
+		name  string
+		trust bool
+		hops  int
+		cf    string
+		xff   string
+		want  string
+	}{
+		{"untrusted ignores headers", false, 2, "7.7.7.7", "8.8.8.8, 10.0.0.2", "10.0.0.1"},
+		{"CF header wins", true, 2, "7.7.7.7", "8.8.8.8, 10.0.0.2", "7.7.7.7"},
+		{"CF header ipv6 masked", true, 2, "2001:db8:1:2::5", "", "2001:db8:1:2::/64"},
+		{"bad CF falls to xff hops=2", true, 2, "junk", "8.8.8.8, 10.0.0.2", "8.8.8.8"},
+		{"hops=1 rightmost", true, 1, "", "8.8.8.8, 10.0.0.2", "10.0.0.2"},
+		{"hops=2 client", true, 2, "", "8.8.8.8, 10.0.0.2", "8.8.8.8"},
+		{"spoofed left entries ignored", true, 2, "", "6.6.6.6, 8.8.8.8, 10.0.0.2", "8.8.8.8"},
+		{"fewer entries than hops", true, 3, "", "8.8.8.8, 10.0.0.2", "10.0.0.1"},
+		{"garbage entry", true, 2, "", "garbage, 10.0.0.2", "10.0.0.1"},
+		{"no headers", true, 2, "", "", "10.0.0.1"},
+		{"hops<1 treated as 1", true, 0, "", "8.8.8.8, 10.0.0.2", "10.0.0.2"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest("POST", "/", nil)
+			r.RemoteAddr = "10.0.0.1:1234"
+			if tc.cf != "" {
+				r.Header.Set("CF-Connecting-IP", tc.cf)
+			}
+			if tc.xff != "" {
+				r.Header.Set("X-Forwarded-For", tc.xff)
+			}
+			if got := clientIP(r, tc.trust, tc.hops); got != tc.want {
+				t.Errorf("got %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIPLimitCountsOnlyUnknownTokens(t *testing.T) {
+	cfg := defaultGuardConfig()
+	cfg.IPBurst = 2
+	cfg.IPRatePerMin = 1
+	h, mock := newGuardHandler(t, cfg)
+	h.now = func() time.Time { return time.Unix(1000, 0) }
+	for i := 0; i < 3; i++ {
+		mock.ExpectQuery("SELECT (.+) FROM connections WHERE webhook_token").
+			WithArgs("bad").WillReturnError(sql.ErrNoRows)
+		rec := postWebhook(h, "bad", `{"text":"x"}`)
+		want := http.StatusUnauthorized
+		if i == 2 {
+			want = http.StatusTooManyRequests // burst of 2 failed lookups used up
+		}
+		if rec.Code != want {
+			t.Fatalf("garbage %d: expected %d, got %d", i, want, rec.Code)
+		}
+		if want == 429 && rec.Header().Get("Retry-After") == "" {
+			t.Error("missing Retry-After")
+		}
+	}
+	// A valid token from the same IP at the same instant is unaffected.
+	expectAccepted(t, mock, h, 1)
+	if rec := postWebhook(h, "tok", `{"text":"hi"}`); rec.Code != http.StatusAccepted {
+		t.Fatalf("valid token: expected 202, got %d", rec.Code)
+	}
+}
+
+func TestValidTokensNeverConsumeIPBudget(t *testing.T) {
+	cfg := defaultGuardConfig()
+	cfg.IPBurst = 1
+	cfg.IPRatePerMin = 1
+	h, mock := newGuardHandler(t, cfg)
+	h.now = func() time.Time { return time.Unix(1000, 0) }
+	for i := 1; i <= 3; i++ {
+		expectAccepted(t, mock, h, i)
+		if rec := postWebhook(h, "tok", `{"text":"m`+strconv.Itoa(i)+`"}`); rec.Code != http.StatusAccepted {
+			t.Fatalf("req %d: expected 202, got %d", i, rec.Code)
+		}
 	}
 }

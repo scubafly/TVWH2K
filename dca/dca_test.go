@@ -1,8 +1,12 @@
 package dca
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -190,7 +194,7 @@ func TestCooldownBlocksSecondOrder(t *testing.T) {
 
 func TestFailedOrderDoesNotSetCooldown(t *testing.T) {
 	f := btcSource(850)
-	f.orderErr = errors.New("boom")
+	f.orderErr = &kraken.APIError{Messages: []string{"EOrder:Insufficient funds"}}
 	s, _ := newSvc(f, false)
 	if err := s.RunOnce(); err == nil {
 		t.Fatal("expected error from failed order")
@@ -254,5 +258,181 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("DCA_AMOUNT_EUR", "")
 	if _, _, err := ConfigFromEnv(); err == nil {
 		t.Error("expected error without DCA_AMOUNT_EUR")
+	}
+}
+
+func TestTransportErrorSetsCooldown(t *testing.T) {
+	f := btcSource(850)
+	f.orderErr = errors.New("HTTP request execution failed: context deadline exceeded")
+	s, _ := newSvc(f, false)
+	if err := s.RunOnce(); err == nil {
+		t.Fatal("expected error")
+	}
+	f.orderErr = nil
+	s.RunOnce()
+	if len(f.orders) != 1 {
+		t.Fatalf("orders = %d, want 1 (cooldown after ambiguous failure)", len(f.orders))
+	}
+	if f.orders[0].UserRef == "" {
+		t.Error("userref not set")
+	}
+}
+
+func TestDefiniteRejectionDoesNotSetCooldown(t *testing.T) {
+	for _, msgs := range [][]string{{"EOrder:Insufficient funds"}} {
+		f := btcSource(850)
+		f.orderErr = fmt.Errorf("wrapped: %w", &kraken.APIError{Messages: msgs})
+		s, _ := newSvc(f, false)
+		s.RunOnce()
+		f.orderErr = nil
+		s.RunOnce()
+		if len(f.orders) != 2 {
+			t.Fatalf("%v: orders = %d, want 2 (retry after rejection)", msgs, len(f.orders))
+		}
+	}
+	// Ambiguous EService errors are not definite.
+	f := btcSource(850)
+	f.orderErr = &kraken.APIError{Messages: []string{"EService:Busy"}}
+	s, _ := newSvc(f, false)
+	s.RunOnce()
+	f.orderErr = nil
+	s.RunOnce()
+	if len(f.orders) != 1 {
+		t.Fatalf("EService: orders = %d, want 1", len(f.orders))
+	}
+}
+
+func TestDailyCapBlocks(t *testing.T) {
+	f := btcSource(850)
+	f.balances["XETH"] = 1
+	f.prices["XETHZEUR"] = 850
+	f.trades = append(f.trades, kraken.Trade{ID: "e", Pair: "XETHZEUR", Type: "buy", Vol: "1", Cost: "1000", Fee: "0"})
+	s, now := newSvc(f, false)
+	s.cfg.MaxDailyEUR = 50 // AmountEUR is 50: only one order per day
+	s.RunOnce()
+	if len(f.orders) != 1 {
+		t.Fatalf("orders = %d, want 1 (cap)", len(f.orders))
+	}
+	*now = now.Add(25 * time.Hour) // next UTC day, cooldown over
+	s.RunOnce()
+	if len(f.orders) != 2 {
+		t.Fatalf("orders = %d, want 2 on next day", len(f.orders))
+	}
+}
+
+func TestStateFileRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	f := btcSource(850)
+	s, now := newSvc(f, false)
+	s.cfg.StateFile = path
+	s.cfg.MaxDailyEUR = 50
+	s.RunOnce()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v, want 600", fi.Mode().Perm())
+	}
+	f2 := btcSource(850)
+	s2 := New(f2, Config{Threshold: -10, AmountEUR: 50, Cooldown: 24 * time.Hour, MinValueEUR: 5, MaxDailyEUR: 50, StateFile: path})
+	s2.now = func() time.Time { return now.Add(time.Hour) }
+	s2.RunOnce()
+	if len(f2.orders) != 0 {
+		t.Fatalf("orders after restart = %d, want 0 (state restored)", len(f2.orders))
+	}
+	// corrupt file is ignored
+	os.WriteFile(path, []byte("{nope"), 0o600)
+	New(f2, Config{StateFile: path})
+}
+
+func TestConfigDailyDefault(t *testing.T) {
+	t.Setenv("DCA_AMOUNT_EUR", "25")
+	cfg, _, err := ConfigFromEnv()
+	if err != nil || cfg.MaxDailyEUR != 75 {
+		t.Fatalf("MaxDailyEUR = %v err %v, want 75", cfg.MaxDailyEUR, err)
+	}
+	t.Setenv("DCA_MAX_DAILY_EUR", "0")
+	cfg, _, _ = ConfigFromEnv()
+	if cfg.MaxDailyEUR != 0 {
+		t.Errorf("0 should disable, got %v", cfg.MaxDailyEUR)
+	}
+}
+
+func TestConfigThresholdMustBeNegative(t *testing.T) {
+	t.Setenv("DCA_AMOUNT_EUR", "25")
+	for _, v := range []string{"0", "5"} {
+		t.Setenv("DCA_THRESHOLD", v)
+		if _, _, err := ConfigFromEnv(); err == nil {
+			t.Errorf("threshold %s should be refused", v)
+		}
+	}
+	t.Setenv("DCA_THRESHOLD", "-5")
+	if _, _, err := ConfigFromEnv(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestConfigLiveNeedsBothSwitches(t *testing.T) {
+	t.Setenv("DCA_AMOUNT_EUR", "25")
+	for _, tc := range []struct {
+		km, live string
+		wantTest bool
+	}{
+		{"false", "true", false},
+		{"false", "", true},
+		{"false", "false", true},
+		{"true", "true", true},
+		{"", "true", true},
+	} {
+		t.Setenv("KRAKEN_TEST_MODE", tc.km)
+		t.Setenv("DCA_LIVE", tc.live)
+		cfg, _, err := ConfigFromEnv()
+		if err != nil || cfg.TestMode != tc.wantTest {
+			t.Errorf("KRAKEN_TEST_MODE=%q DCA_LIVE=%q: TestMode=%v want %v (%v)", tc.km, tc.live, cfg.TestMode, tc.wantTest, err)
+		}
+	}
+}
+
+func TestMarginTradesSkippedInAverageCost(t *testing.T) {
+	m := buy("1", "5000", "0")
+	m.PosStatus = "open"
+	vol, avg, ok, err := AverageCost([]kraken.Trade{buy("1", "1000", "0"), m})
+	if err != nil || !ok || vol != 1 || avg != 1000 {
+		t.Fatalf("vol=%v avg=%v ok=%v err=%v", vol, avg, ok, err)
+	}
+	m2 := buy("1", "5000", "0")
+	m2.Margin = "12.5"
+	if vol, _, _, _ := AverageCost([]kraken.Trade{m2}); vol != 0 {
+		t.Errorf("margin amount trade counted, vol=%v", vol)
+	}
+}
+
+func TestRunWaitsOneIntervalWithoutState(t *testing.T) {
+	f := btcSource(850)
+	s, _ := newSvc(f, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.Run(ctx, time.Hour); close(done) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+	if len(f.orders) != 0 {
+		t.Fatalf("orders = %d, want 0 (no immediate run without state)", len(f.orders))
+	}
+
+	// With a loaded state file the first run is immediate.
+	path := filepath.Join(t.TempDir(), "s.json")
+	os.WriteFile(path, []byte(`{"last":{},"spent_day":"","spent":0}`), 0o600)
+	f2 := btcSource(850)
+	s2 := New(f2, Config{Threshold: -10, AmountEUR: 50, Cooldown: time.Hour, MinValueEUR: 5, StateFile: path})
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan struct{})
+	go func() { s2.Run(ctx2, time.Hour); close(done2) }()
+	time.Sleep(100 * time.Millisecond)
+	cancel2()
+	<-done2
+	if len(f2.orders) != 1 {
+		t.Fatalf("orders = %d, want 1 (immediate run with state)", len(f2.orders))
 	}
 }

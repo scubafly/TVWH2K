@@ -2,6 +2,12 @@
 # In the tunnel, point BOTH public hostnames at http://caddy:80.
 {
 	auto_https off
+	# Only cloudflared (private docker network) reaches caddy, so trust the
+	# private ranges: X-Forwarded-For from cloudflared/Cloudflare is kept and
+	# cloudflared's address is appended; CF-Connecting-IP passes through untouched.
+	servers {
+		trusted_proxies static private_ranges
+	}
 }
 
 # https://auth.<domain>  -> GoTrue. supabase-js calls <VITE_SUPABASE_URL>/auth/v1/*

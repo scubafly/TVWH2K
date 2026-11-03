@@ -9,7 +9,7 @@ No ports are published; the only outbound connection is cloudflared to Cloudflar
 
 The browser talks to GoTrue directly, so GoTrue must be publicly reachable (`auth.<domain>`) and the API too (`api.<domain>`, also used by TradingView webhooks).
 supabase-js requests `<VITE_SUPABASE_URL>/auth/v1/...`, but GoTrue serves at root (`/signup`, `/token`, `/user`). Caddy strips `/auth/v1` for `auth.<domain>`.
-Frontend: `VITE_SUPABASE_URL=https://auth.<domain>` (no suffix). The "anon key" supabase-js requires can be any JWT signed with `SUPABASE_JWT_SECRET` (GoTrue does not check it); generate one, e.g. with jwt.io HS256 payload `{"role":"anon"}`.
+Frontend: `VITE_SUPABASE_URL=https://auth.<domain>` (no suffix). The "anon key" supabase-js requires can be any JWT signed with `SUPABASE_JWT_SECRET` (GoTrue does not check it); generate one with the openssl snippet in PORTAINER-GUIDE.md (HS256, payload `{"role":"anon"}`); do not paste your secret into online JWT tools.
 
 ## Steps
 1. Copy `deploy/nas/` to the NAS (e.g. `/volume1/docker/tvwh2k`). `cp .env.selfhost.example .env.selfhost; chmod 600 .env.selfhost`.
@@ -39,11 +39,11 @@ All services use `restart: unless-stopped`: they come back after NAS/docker rest
 
 ## Verify
 - `docker compose ... ps`: all Up, postgres healthy; `docker ps` shows no published ports.
-- `curl https://auth.<domain>/auth/v1/settings` returns JSON (`disable_signup:false`; with autoconfirm `mailer_autoconfirm:true`).
-- Sign up from the frontend; user appears in `auth.users`; API calls with the returned access token succeed (no 401).
+- `curl https://auth.<domain>/auth/v1/settings` returns JSON (`disable_signup:true` by default).
+- Create the operator account (temporarily `GOTRUE_DISABLE_SIGNUP=false` + `GOTRUE_MAILER_AUTOCONFIRM=true` if no SMTP, then restore defaults; or the admin API, see PORTAINER-GUIDE.md section 7); user appears in `auth.users`; API calls with the returned access token succeed (no 401).
 - Create a connection; POST to the webhook URL returns dry-run result (KRAKEN_TEST_MODE=true).
 - `./backup.sh` produces a dump; `pg_restore --list` reads it.
-- Set `GOTRUE_MAILER_AUTOCONFIRM=false` and configure SMTP only if you want email confirmation.
+- Defaults are closed (`GOTRUE_DISABLE_SIGNUP=true`, `GOTRUE_MAILER_AUTOCONFIRM=false`); email confirmation needs SMTP_*. Backups are mode 600 in a 700 directory.
 
 ## Notes
 - Image tags: GoTrue pinned to `supabase/gotrue:v2.188.1`; cloudflared is `latest` (bump deliberately).

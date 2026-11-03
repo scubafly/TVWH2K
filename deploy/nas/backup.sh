@@ -16,7 +16,9 @@ DB="${POSTGRES_DB:-tvwh2k}"
 DIR="${BACKUP_DIR:-./backups}"
 KEEP="${BACKUP_RETENTION_DAYS:-14}"
 
+umask 077
 mkdir -p "$DIR"
+chmod 700 "$DIR"
 OUT="$DIR/${DB}_$(date +%Y%m%d_%H%M%S).dump"
 TMP="$OUT.partial"
 

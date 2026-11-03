@@ -56,7 +56,7 @@ func (k *Kraken) AddOrder(order OrderInput) (*AddOrderResponse, error) {
 	}
 
 	if len(genericResp.Error) > 0 {
-		return nil, fmt.Errorf("Kraken API error: %v", genericResp.Error)
+		return nil, &APIError{Messages: genericResp.Error}
 	}
 
 	var addOrderResp AddOrderResponse

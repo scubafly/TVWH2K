@@ -84,6 +84,28 @@ func TestGetTradesHistoryPaginatesAndSorts(t *testing.T) {
 	}
 }
 
+func TestGetTradesHistoryDedupesByTxid(t *testing.T) {
+	k := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		switch r.PostForm.Get("ofs") {
+		case "0":
+			w.Write([]byte(`{"error":[],"result":{"count":3,"trades":{"T1":{"pair":"XXBTZEUR","time":100,"type":"buy","price":"1","cost":"1","fee":"0","vol":"1","margin":"0.00000"},"T2":{"pair":"XXBTZEUR","time":200,"type":"buy","price":"2","cost":"2","fee":"0","vol":"1","margin":12.5,"posstatus":"open"}}}}`))
+		default:
+			w.Write([]byte(`{"error":[],"result":{"count":3,"trades":{"T2":{"pair":"XXBTZEUR","time":200,"type":"buy","price":"2","cost":"2","fee":"0","vol":"1"}}}}`))
+		}
+	})
+	got, err := k.GetTradesHistory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 unique trades, got %+v", got)
+	}
+	if got[0].IsMargin() || !got[1].IsMargin() {
+		t.Errorf("margin detection wrong: %+v", got)
+	}
+}
+
 func TestGetTradesHistoryErrors(t *testing.T) {
 	for name, tc := range map[string]struct {
 		body   string

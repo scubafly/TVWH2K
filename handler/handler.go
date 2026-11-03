@@ -114,11 +114,6 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if ok, wait := h.ipLimit.allow(clientIP(r, h.cfg.TrustProxy), h.now()); !ok {
-		tooMany(w, wait)
-		return
-	}
-
 	var req WebhookRequest
 	r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -137,6 +132,13 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := h.db.GetConnectionByWebhookToken(token)
 	if errors.Is(err, sql.ErrNoRows) {
+		// TradingView alerts come from a few shared IPs, so a plain per-IP
+		// limit would throttle every user. The IP limiter only counts failed
+		// token lookups; valid tokens are limited per token (below).
+		if ok, wait := h.ipLimit.allow(clientIP(r, h.cfg.TrustProxy, h.cfg.TrustedHops), h.now()); !ok {
+			tooMany(w, wait)
+			return
+		}
 		http.Error(w, "Unknown webhook token", http.StatusUnauthorized)
 		return
 	}

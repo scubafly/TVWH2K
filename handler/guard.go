@@ -27,7 +27,8 @@ type guardConfig struct {
 	DedupWindow     time.Duration // WEBHOOK_DEDUP_WINDOW (0 disables)
 	MaxBodyBytes    int64         // WEBHOOK_MAX_BODY_BYTES
 	MaxVolume       float64       // WEBHOOK_MAX_VOLUME
-	TrustProxy      bool          // WEBHOOK_TRUST_PROXY: use last X-Forwarded-For hop as client IP
+	TrustProxy      bool          // WEBHOOK_TRUST_PROXY: derive client IP from CF-Connecting-IP / X-Forwarded-For
+	TrustedHops     int           // WEBHOOK_TRUSTED_HOPS: proxies appending to X-Forwarded-For (default 2)
 }
 
 func defaultGuardConfig() guardConfig {
@@ -39,6 +40,7 @@ func defaultGuardConfig() guardConfig {
 		DedupWindow:     60 * time.Second,
 		MaxBodyBytes:    16 * 1024,
 		MaxVolume:       1000000,
+		TrustedHops:     2,
 	}
 }
 
@@ -84,6 +86,13 @@ func guardConfigFromEnv() guardConfig {
 		}
 	}
 	c.TrustProxy = os.Getenv("WEBHOOK_TRUST_PROXY") == "true"
+	if v := os.Getenv("WEBHOOK_TRUSTED_HOPS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 10 {
+			c.TrustedHops = n
+		} else {
+			log.Printf("Ignoring invalid WEBHOOK_TRUSTED_HOPS=%q", v)
+		}
+	}
 	return c
 }
 
@@ -193,12 +202,30 @@ func dedupKey(token string, req WebhookRequest) string {
 
 // --- client IP ---
 
-func clientIP(r *http.Request, trustProxy bool) string {
+// clientIP returns the rate-limit identity of the caller.
+//
+// Without trustProxy only RemoteAddr is used. With trustProxy (only safe when
+// the API is reachable exclusively through the trusted proxy chain, here
+// Cloudflare tunnel -> caddy -> api):
+//  1. CF-Connecting-IP, if it parses as an IP (set by Cloudflare itself);
+//  2. else the hops-th entry of X-Forwarded-For counted from the right
+//     (hops=1 is the right-most entry, i.e. the address the nearest proxy saw;
+//     with caddy appending cloudflared's address, hops=2 is the real client);
+//  3. else RemoteAddr. Unparsable values always fall back to RemoteAddr.
+func clientIP(r *http.Request, trustProxy bool, hops int) string {
 	if trustProxy {
+		if ip := net.ParseIP(strings.TrimSpace(r.Header.Get("CF-Connecting-IP"))); ip != nil {
+			return ipKey(ip)
+		}
+		if hops < 1 {
+			hops = 1
+		}
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			parts := strings.Split(xff, ",")
-			if ip := net.ParseIP(strings.TrimSpace(parts[len(parts)-1])); ip != nil {
-				return ipKey(ip)
+			if len(parts) >= hops {
+				if ip := net.ParseIP(strings.TrimSpace(parts[len(parts)-hops])); ip != nil {
+					return ipKey(ip)
+				}
 			}
 		}
 	}

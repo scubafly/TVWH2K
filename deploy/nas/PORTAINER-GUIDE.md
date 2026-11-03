@@ -18,7 +18,8 @@ B=/volume1/docker/tradingbridge
 sudo mkdir -p $B/postgres $B/backups $B/caddy-data $B/caddy-config $B/config
 sudo chown 999:999 $B/postgres && sudo chmod 700 $B/postgres   # postgres:16 runs as uid/gid 999
 sudo chown 0:0 $B/backups $B/caddy-data $B/caddy-config         # backup + caddy containers run as root
-sudo chmod 755 $B/backups $B/caddy-data $B/caddy-config
+sudo chmod 700 $B/backups                                       # dumps contain all data; root only
+sudo chmod 755 $B/caddy-data $B/caddy-config
 ```
 GoTrue (uid 1000) and the API (distroless nonroot) write nothing to disk. If File Station is used, still run the `chown 999:999` for `postgres` over SSH. Different base path: set variable `TB_BASE`.
 
@@ -33,7 +34,7 @@ openssl rand -hex 24      # POSTGRES_PASSWORD
 openssl rand -hex 32      # JWT_SECRET
 openssl rand -base64 32   # ENCRYPTION_KEY (back it up; losing it loses stored Kraken keys)
 ```
-Also `AUTH_HOST`, `API_HOST`, `SITE_URL` (frontend origin), `TUNNEL_TOKEN`, optional `SMTP_*` (Gmail: host `smtp.gmail.com`, port 587, an app password; then `GOTRUE_MAILER_AUTOCONFIRM=false`).
+Also `AUTH_HOST`, `API_HOST`, `SITE_URL` (frontend origin), `TUNNEL_TOKEN`, optional `SMTP_*` (Gmail: host `smtp.gmail.com`, port 587, an app password). Defaults are closed: `GOTRUE_DISABLE_SIGNUP=true`, `GOTRUE_MAILER_AUTOCONFIRM=false`. Optional `WEBHOOK_TRUSTED_HOPS` (default 2 = cloudflared + caddy; the API prefers `CF-Connecting-IP`).
 
 ## 5. Deploy order
 Deploy the single stack once with "Deploy the stack". Compose orders it: postgres -> gotrue -> migrate (waits for `auth.users`, applies SQL once, tracked in `tb_migrations`) -> api, backup -> caddy -> cloudflared. Check Portainer: `migrate` Exited (0), everything else running. Redeploys are safe (migrations are skipped).
@@ -48,8 +49,20 @@ s=$(printf '%s.%s' $h $p | openssl dgst -sha256 -hmac "$JWT_SECRET" -binary | op
 echo "$h.$p.$s"
 ```
 
-## 7. Close signup after your first account
-Create your account via the frontend (or the curl below). Then in Portainer > Stack > Environment variables set `GOTRUE_DISABLE_SIGNUP=true` > Update the stack (re-deploy). Verify the signup curl now fails (403).
+## 7. Create the operator account (signup is closed by default)
+A fresh deploy has `GOTRUE_DISABLE_SIGNUP=true` and `GOTRUE_MAILER_AUTOCONFIRM=false`, so nobody can register. Either:
+
+**A. Temporary open signup.** In Portainer > Stack > Environment variables set `GOTRUE_DISABLE_SIGNUP=false` (and `GOTRUE_MAILER_AUTOCONFIRM=true` if you have no SMTP yet) > Update the stack. Sign up via the frontend or the signup curl in section 8. Then remove both variables (back to the secure defaults) > Update the stack again. Verify the signup curl now fails (403).
+
+**B. GoTrue admin API** (signup stays closed). Use a service-role JWT signed with `JWT_SECRET` (same recipe as the anon key in section 6 but `"role":"service_role"`), kept in your shell only:
+```
+export SERVICE_JWT=...   # HS256, role=service_role, signed with JWT_SECRET
+export OPERATOR_PASSWORD=...
+curl -s -X POST https://auth.<domain>/auth/v1/admin/users \
+  -H "Authorization: Bearer $SERVICE_JWT" -H "apikey: $SERVICE_JWT" -H 'Content-Type: application/json' \
+  -d "{\"email\":\"me@example.com\",\"password\":\"$OPERATOR_PASSWORD\",\"email_confirm\":true}"
+```
+(`email_confirm:true` works without SMTP.) Do not leave the service JWT in shell history or files.
 
 ## 8. Smoke tests
 ```
@@ -62,7 +75,7 @@ curl -s -H "Authorization: Bearer <access_token>" https://api.<domain>/api/conne
 ```
 
 ## 9. Backups (Portainer only)
-The `backup` service writes `<db>_<timestamp>.dump` (pg_dump -Fc) every 24 h (first one at deploy) into `$B/backups`, keeping `BACKUP_RETENTION_DAYS` (14). Files are root-owned; copy them off the NAS too. Manual dump: Portainer > Containers > `tvwh2k-postgres-1` > Console (`/bin/bash`): `pg_dump -U postgres -Fc tvwh2k > /var/lib/postgresql/data/manual.dump` (then move it), or just restart the `backup` container to force a dump. The old `backup.sh` also still works over SSH (`PG_CONTAINER=<postgres container name>`).
+The `backup` service writes `<db>_<timestamp>.dump` (pg_dump -Fc) every 24 h (first one at deploy) into `$B/backups`, keeping `BACKUP_RETENTION_DAYS` (14). Files are root-owned, mode 600 in a 700 directory (read them with `sudo`); copy them off the NAS too. Manual dump: Portainer > Containers > `tvwh2k-postgres-1` > Console (`/bin/bash`): `pg_dump -U postgres -Fc tvwh2k > /var/lib/postgresql/data/manual.dump` (then move it), or just restart the `backup` container to force a dump. The old `backup.sh` also still works over SSH (`PG_CONTAINER=<postgres container name>`).
 
 ## 10. Restore
 1. Portainer: stop `api`, `gotrue`, `backup`.
