@@ -380,3 +380,24 @@ func TestToResponseEffectiveLive(t *testing.T) {
 		t.Error("server test mode must make effective_live false")
 	}
 }
+
+func TestMainWiringCreateAddsTokenToWebhookIndex(t *testing.T) {
+	db, mock := newMockDB(t)
+	wh := newWebhookHandlerForTest(t, db, &fakeKraken{}, true)
+	defer wh.Close()
+	ch := newConnectionsHandlerForTest(t, db, "ok")
+	ch.UseTokenIndex(wh.TokenIndex()) // as in main.go
+
+	mock.ExpectQuery("SELECT COUNT").WithArgs("user-1").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery("INSERT INTO connections").
+		WillReturnRows(connectionRow(t, ch.encryptor, 7, "tokwired", true))
+	rec := httptest.NewRecorder()
+	ch.Create(rec, authedRequest("POST", "/api/connections", `{"kraken_api_key":"k","kraken_api_secret":"s"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !wh.TokenIndex().Has("tokwired") {
+		t.Fatal("webhook handler's index missing created token")
+	}
+}

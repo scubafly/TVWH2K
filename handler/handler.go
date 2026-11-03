@@ -160,6 +160,13 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Per-token limit runs before the DB lookup: only indexed tokens reach it,
+	// so limiter state stays bounded and a flood never touches the DB.
+	if ok, wait := h.tkLimit.allow(token, h.now()); !ok {
+		tooMany(w, wait)
+		return
+	}
+
 	conn, err := h.db.GetConnectionByWebhookToken(token)
 	if errors.Is(err, sql.ErrNoRows) {
 		// In the set but gone from the DB (deleted/rotated elsewhere): drop it.
@@ -173,11 +180,6 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Only valid tokens reach here, so the per-token state stays bounded.
-	if ok, wait := h.tkLimit.allow(token, h.now()); !ok {
-		tooMany(w, wait)
-		return
-	}
 	key := dedupKey(token, req)
 	if !h.dedup.firstSeen(key, h.now()) {
 		w.Header().Set("Content-Type", "application/json")

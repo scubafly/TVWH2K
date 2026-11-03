@@ -9,7 +9,7 @@ import (
 // hashes, never the raw token). The webhook path consults it before touching
 // the database:
 //
-//   - token in the set      -> proceed to the DB lookup, NO per-IP block.
+//   - token in the set      -> per-token limiter, then the DB lookup; NO per-IP block.
 //   - token not in the set  -> strict per-IP limiter, then 401/429; the DB is
 //     never queried.
 //
@@ -75,6 +75,9 @@ func (x *TokenIndex) Len() int {
 
 // Replace swaps the whole set for the given tokens.
 func (x *TokenIndex) Replace(tokens []string) {
+	if x == nil {
+		return
+	}
 	m := make(map[[32]byte]struct{}, len(tokens))
 	for _, t := range tokens {
 		m[hashToken(t)] = struct{}{}

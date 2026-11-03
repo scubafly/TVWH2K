@@ -246,10 +246,7 @@ func TestWebhookRateLimit(t *testing.T) {
 					t.Fatalf("req %d: expected 202, got %d", i, rec.Code)
 				}
 			}
-			if tc.name == "per token" {
-				mock.ExpectQuery("SELECT (.+) FROM connections WHERE webhook_token").
-					WillReturnRows(connectionRow(t, newTestEncryptor(t), 1, "tok", true))
-			}
+			// No DB expectation for the 3rd request: limiter runs before the lookup.
 			rec := postWebhook(h, "tok", `{"text":"3"}`)
 			if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
 				t.Fatalf("expected 429 with Retry-After, got %d", rec.Code)
@@ -396,6 +393,42 @@ func TestLoadTokensAtStartup(t *testing.T) {
 	mock.ExpectQuery("SELECT webhook_token FROM connections").WillReturnError(sql.ErrConnDone)
 	if err := h.LoadTokens(); err == nil {
 		t.Fatal("expected load error")
+	}
+	if !h.tokens.Has("a") || !h.tokens.Has("b") || h.tokens.Len() != 2 {
+		t.Fatal("existing set changed after failed load")
+	}
+}
+
+func TestValidTokenFloodLimitedPerTokenBeforeDB(t *testing.T) {
+	cfg := defaultGuardConfig()
+	cfg.TokenBurst = 3
+	cfg.TokenRatePerMin = 1
+	h, mock := newGuardHandler(t, cfg)
+	h.now = func() time.Time { return time.Unix(1000, 0) }
+	h.tokens.Add("tok")
+	h.tokens.Add("tok2")
+	for i := 0; i < 3; i++ {
+		expectAccepted(t, mock, h, i+1) // exactly burst-many DB lookups allowed
+		if rec := postWebhook(h, "tok", `{"text":"`+strconv.Itoa(i)+`"}`); rec.Code != http.StatusAccepted {
+			t.Fatalf("req %d: expected 202, got %d", i, rec.Code)
+		}
+	}
+	for i := 0; i < 20; i++ { // flood: no further expectations, any DB call fails
+		rec := postWebhook(h, "tok", `{"text":"f`+strconv.Itoa(i)+`"}`)
+		if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
+			t.Fatalf("flood %d: expected 429 with Retry-After, got %d", i, rec.Code)
+		}
+	}
+	// A different valid token from the same IP is unaffected.
+	mock.ExpectQuery("SELECT (.+) FROM connections WHERE webhook_token").
+		WillReturnRows(connectionRow(t, newTestEncryptor(t), 2, "tok2", true))
+	mock.ExpectQuery("INSERT INTO signals").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(9))
+	if rec := postWebhook(h, "tok2", `{"text":"other"}`); rec.Code != http.StatusAccepted {
+		t.Fatalf("other token: expected 202, got %d", rec.Code)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
 

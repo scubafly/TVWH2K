@@ -64,7 +64,7 @@ Safety: any `AddOrder` error that is not a clear Kraken rejection (timeout, tran
 
 Signals are validated: `type` must be buy/sell, `pair` alphanumeric (optionally `BASE/QUOTE`), `ordertype` a known Kraken type, price fields numeric; payloads without pair/type/volume are accepted as text-only notifications. Limits are in-memory and per process.
 
-**Valid-token set (final design, do not revert).** The API keeps SHA-256 hashes of all webhook tokens in memory, loaded from the DB at startup (startup fails if the load fails) and updated on connection create. A token in the set goes on to the DB lookup with no per-IP block; a token not in the set only consumes the strict per-IP budget and never touches the DB. Residual risks: single process only (a second API instance or an out-of-band DB change needs a restart to refresh the set); an attacker needs a valid token to bypass the limits; shared TradingView IPs are never blocked for valid tokens.
+**Valid-token set (final design, do not revert).** The API keeps SHA-256 hashes of all webhook tokens in memory, loaded from the DB at startup (startup fails if the load fails) and updated on connection create. A token in the set hits the per-token limiter (before any DB access, 429 + Retry-After when exhausted) and then the DB lookup, with no per-IP block; a token not in the set only consumes the strict per-IP budget and never touches the DB. Residual risks: single process only (a second API instance or an out-of-band DB change needs a restart to refresh the set); an attacker needs a valid token to bypass the limits; shared TradingView IPs are never blocked for valid tokens.
 
 ## API
 
