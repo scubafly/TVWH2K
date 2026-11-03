@@ -13,7 +13,9 @@ import (
 
 	"tvwh2k/auth"
 	"tvwh2k/database"
+	"tvwh2k/dca"
 	"tvwh2k/handler"
+	"tvwh2k/kraken"
 	"tvwh2k/security"
 )
 
@@ -54,6 +56,24 @@ func main() {
 
 	webhookHandler := handler.NewWebhookHandler(db, encryptor, testMode)
 	connectionsHandler := handler.NewConnectionsHandler(db, encryptor, apiBaseURL, testMode)
+
+	// Optional own-account DCA runner (off by default). Uses KRAKEN_API_KEY /
+	// KRAKEN_API_SECRET; orders are validate-only while KRAKEN_TEST_MODE != "false".
+	dcaCtx, dcaStop := context.WithCancel(context.Background())
+	defer dcaStop()
+	if dca.Enabled() {
+		dcaCfg, dcaInterval, err := dca.ConfigFromEnv()
+		if err != nil {
+			log.Fatalf("Invalid DCA config: %v", err)
+		}
+		kc, err := kraken.NewClient(os.Getenv("KRAKEN_API_KEY"), os.Getenv("KRAKEN_API_SECRET"))
+		if err != nil {
+			log.Fatalf("DCA enabled but Kraken client failed: %v", err)
+		}
+		go dca.New(&dca.KrakenSource{K: kc}, dcaCfg).Run(dcaCtx, dcaInterval)
+		fmt.Printf("DCA runner enabled (threshold %.1f%%, amount %.2f, interval %s, validate-only=%t).\n",
+			dcaCfg.Threshold, dcaCfg.AmountEUR, dcaInterval, dcaCfg.TestMode)
+	}
 
 	mux := http.NewServeMux()
 

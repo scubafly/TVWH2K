@@ -14,7 +14,7 @@
 ## Architecture
 
 - **Auth + user table**: Supabase Auth. The frontend signs users up/in and gets a JWT; this backend verifies that JWT (`SUPABASE_JWT_SECRET`) on every authenticated API route.
-- **Database**: Postgres (Supabase-hosted). Run `migrations/0001_init.sql` against your Supabase project before starting the app.
+- **Database**: Postgres (Supabase-hosted). Run `migrations/0001_init.sql` and `migrations/0002_live_enabled.sql` against your Supabase project before starting the app.
 - **Encryption**: `security/crypto.go` — AES-256-GCM, key from `ENCRYPTION_KEY` (`openssl rand -base64 32`).
 - **Webhook**: `POST /webhooks/{token}` — no shared secret anymore, the unguessable per-connection token in the URL is the auth. Get your own token via `POST /api/connections`.
 
@@ -31,6 +31,34 @@ FRONTEND_ORIGIN=https://tradingbridge.online
 KRAKEN_TEST_MODE=true
 PORT=8081
 ```
+
+## DCA runner (optional, own account)
+Off by default; does not touch the webhook. Averages down losing **spot** holdings (no margin) by buying `DCA_AMOUNT_EUR` of the EUR pair when unrealized PnL is below the threshold. Positions come from account balances; cost basis is the volume-weighted average entry from trade history (average-cost: sells reduce volume at the average cost, buy fees count as cost). EUR, stablecoins, staked assets and dust below `DCA_MIN_VALUE_EUR` are skipped, as is any asset whose balance exceeds the trade-history volume (deposits/transfers: unknown basis). Orders are validate-only while `KRAKEN_TEST_MODE` is not `false`.
+
+Known limitations: the cooldown is in-memory (lost on restart, so a restart can trigger another buy); overlaps with tribot `cmd/portfolio`, which already does spot DCA, so do not run both on the same account.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `DCA_ENABLED` | `false` | set `true` to start the runner (needs `KRAKEN_API_KEY`, `KRAKEN_API_SECRET`) |
+| `DCA_THRESHOLD` | `-10.0` | PnL % below which a buy triggers |
+| `DCA_AMOUNT_EUR` | required | quote amount per DCA buy (EUR pairs only) |
+| `DCA_COOLDOWN_HOURS` | `24` | min hours between DCA buys per position |
+| `DCA_MIN_VALUE_EUR` | `5` | holdings worth less are ignored as dust |
+| `DCA_INTERVAL_MINUTES` | `5` | check interval |
+
+## Webhook hardening
+`POST /webhooks/{token}` is protected by (all env vars optional):
+
+| Env var | Default | Effect |
+|---|---|---|
+| `WEBHOOK_TOKEN_RATE_PER_MIN` / `WEBHOOK_TOKEN_BURST` | `30` / `10` | per-token token bucket, 429 + `Retry-After` when empty |
+| `WEBHOOK_IP_RATE_PER_MIN` / `WEBHOOK_IP_BURST` | `120` / `30` | per-client-IP token bucket |
+| `WEBHOOK_DEDUP_WINDOW` | `60s` | identical payload (or same optional `idempotency_id`) for the same token inside the window returns 200 `{"status":"duplicate"}` and is not enqueued; `0` disables |
+| `WEBHOOK_MAX_BODY_BYTES` | `16384` | larger bodies get 413 |
+| `WEBHOOK_MAX_VOLUME` | `1000000` | volume must be a plain decimal, > 0 and <= this, else 400 |
+| `WEBHOOK_TRUST_PROXY` | `false` | when `true`, client IP is the last `X-Forwarded-For` hop (only behind a trusted proxy) |
+
+Signals are validated: `type` must be buy/sell, `pair` alphanumeric (optionally `BASE/QUOTE`), `ordertype` a known Kraken type, price fields numeric; payloads without pair/type/volume are accepted as text-only notifications. Limits are in-memory and per process.
 
 ## API
 
@@ -59,12 +87,12 @@ PORT=8081
 - `GET /api/trades?connection_id=` — last 50 trades for that connection; `status` is `executed`, `validated` (test mode dry-run) or `failed`.
 
 ## Test mode / going live
-All orders are sent to Kraken with the `validate` flag (dry-run) unless the server is started with `KRAKEN_TEST_MODE=false`. This is a server-wide kill-switch; the per-connection `test_mode` column also forces dry-run when set.
+All orders are sent to Kraken with the `validate` flag (dry-run) unless ALL of these hold: the server runs with `KRAKEN_TEST_MODE=false`, the connection's `test_mode` is false, and the connection has opted in with `live_enabled` (default false; existing connections stay dry-run). Set it via `POST /api/connections` or `PATCH /api/connections/{id}` with `{"live_enabled": true, "confirm_live": true}`; `live_enabled: true` without `confirm_live: true` is rejected with 400. Apply `migrations/0002_live_enabled.sql` before deploying.
 
 ## Docker
 - `docker compose up --build`
 
 ## Local Development
-1. Create a Supabase project, run `migrations/0001_init.sql` against it (SQL editor or `psql "$DATABASE_URL" -f migrations/0001_init.sql`).
+1. Create a Supabase project, run `migrations/0001_init.sql` and then `migrations/0002_live_enabled.sql` against it (SQL editor or `psql "$DATABASE_URL" -f migrations/0001_init.sql -f migrations/0002_live_enabled.sql`).
 2. Copy `.env.example` to `.env` and fill in real values.
 3. `go build && go run .`
