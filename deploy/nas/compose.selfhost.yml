@@ -1,0 +1,108 @@
+# Self-hosted stack: Postgres + GoTrue + TVWH2K API + Caddy + cloudflared.
+# No ports are published. Only cloudflared makes outbound connections
+# (to Cloudflare); all other services live on the private "internal" network.
+# Usage: docker compose --env-file .env.selfhost -f compose.selfhost.yml up -d
+name: tvwh2k
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: tvwh2k-pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB:-tvwh2k}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [internal]
+    restart: unless-stopped
+
+  gotrue:
+    image: supabase/gotrue:v2.188.1
+    container_name: tvwh2k-gotrue
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: "9999"
+      API_EXTERNAL_URL: "${API_EXTERNAL_URL:?set API_EXTERNAL_URL}"
+      GOTRUE_SITE_URL: "${SITE_URL:?set SITE_URL}"
+      GOTRUE_URI_ALLOW_LIST: "${GOTRUE_URI_ALLOW_LIST:-}"
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_NAMESPACE: auth
+      # search_path=auth keeps GoTrue's tables (auth.users, ...) in the auth schema.
+      GOTRUE_DB_DATABASE_URL: "postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tvwh2k}?search_path=auth"
+      DATABASE_URL: "postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tvwh2k}?search_path=auth"
+      GOTRUE_JWT_SECRET: "${SUPABASE_JWT_SECRET:?set SUPABASE_JWT_SECRET}"
+      GOTRUE_JWT_ALGORITHM: HS256
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: "3600"
+      # Closed by default. For the first account run once with GOTRUE_DISABLE_SIGNUP=false
+      # (and GOTRUE_MAILER_AUTOCONFIRM=true without SMTP), sign up, then restore defaults.
+      GOTRUE_DISABLE_SIGNUP: "${GOTRUE_DISABLE_SIGNUP:-true}"
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "${GOTRUE_MAILER_AUTOCONFIRM:-false}"
+      # SMTP only needed when autoconfirm=false.
+      GOTRUE_SMTP_HOST: "${SMTP_HOST:-}"
+      GOTRUE_SMTP_PORT: "${SMTP_PORT:-587}"
+      GOTRUE_SMTP_USER: "${SMTP_USER:-}"
+      GOTRUE_SMTP_PASS: "${SMTP_PASS:-}"
+      GOTRUE_SMTP_ADMIN_EMAIL: "${SMTP_ADMIN_EMAIL:-}"
+    networks: [internal]
+    restart: unless-stopped
+
+  tvwh2k:
+    image: ghcr.io/scubafly/tvwh2k:latest
+    container_name: tvwh2k
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tvwh2k}?sslmode=disable"
+      SUPABASE_JWT_SECRET: "${SUPABASE_JWT_SECRET}"
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY:?set ENCRYPTION_KEY}"
+      API_BASE_URL: "${API_BASE_URL:?set API_BASE_URL}"
+      FRONTEND_ORIGIN: "${FRONTEND_ORIGIN:?set FRONTEND_ORIGIN}"
+      KRAKEN_TEST_MODE: "${KRAKEN_TEST_MODE:-true}"
+      # Behind Caddy/Cloudflare: trust proxy headers for client IP.
+      WEBHOOK_TRUST_PROXY: "${WEBHOOK_TRUST_PROXY:-true}"
+      WEBHOOK_TRUSTED_HOPS: "${WEBHOOK_TRUSTED_HOPS:-2}"
+      PORT: "8081"
+    networks: [internal]
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    container_name: tvwh2k-caddy
+    depends_on: [gotrue, tvwh2k]
+    environment:
+      API_HOST: "${API_HOST:?set API_HOST}"
+      AUTH_HOST: "${AUTH_HOST:?set AUTH_HOST}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    networks: [internal]
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: tvwh2k-cloudflared
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: "${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN}"
+    depends_on: [caddy]
+    networks: [internal]
+    restart: unless-stopped
+
+networks:
+  internal:
+
+volumes:
+  pgdata:

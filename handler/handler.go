@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 
 	"tvwh2k/database"
 	"tvwh2k/kraken"
@@ -37,6 +38,13 @@ type WebhookHandler struct {
 	wg        sync.WaitGroup
 	testMode  bool // global kill-switch: when true, all Kraken orders are validate-only
 	newKraken func(apiKey, apiSecret string) (orderPlacer, error)
+
+	cfg     guardConfig
+	tokens  *TokenIndex  // valid-token set; see TokenIndex for the final design
+	ipLimit *rateLimiter // strict, tokens not in the set only
+	tkLimit *rateLimiter
+	dedup   *deduper
+	now     func() time.Time
 }
 
 type signalJob struct {
@@ -51,15 +59,39 @@ func NewWebhookHandler(db *database.DB, encryptor *security.Encryptor, testMode 
 		encryptor: encryptor,
 		jobs:      make(chan signalJob, jobQueueSize),
 		testMode:  testMode,
+		tokens:    NewTokenIndex(),
+		now:       time.Now,
 		newKraken: func(apiKey, apiSecret string) (orderPlacer, error) {
 			return kraken.NewClient(apiKey, apiSecret)
 		},
 	}
+	h.setGuardConfig(guardConfigFromEnv())
 	h.wg.Add(workerCount)
 	for i := 0; i < workerCount; i++ {
 		go h.worker()
 	}
 	return h
+}
+
+func (h *WebhookHandler) setGuardConfig(c guardConfig) {
+	h.cfg = c
+	h.ipLimit = newRateLimiter(c.IPRatePerMin, c.IPBurst)
+	h.tkLimit = newRateLimiter(c.TokenRatePerMin, c.TokenBurst)
+	h.dedup = newDeduper(c.DedupWindow)
+}
+
+// TokenIndex returns the valid-token set, to be shared with ConnectionsHandler.
+func (h *WebhookHandler) TokenIndex() *TokenIndex { return h.tokens }
+
+// LoadTokens fills the valid-token set from the database. Call before serving;
+// a failure must abort startup (an empty set would reject every webhook).
+func (h *WebhookHandler) LoadTokens() error {
+	toks, err := h.db.ListWebhookTokens()
+	if err != nil {
+		return fmt.Errorf("load webhook tokens: %w", err)
+	}
+	h.tokens.Replace(toks)
+	return nil
 }
 
 // Close stops accepting new jobs and waits for in-flight signals to finish.
@@ -78,6 +110,10 @@ type WebhookRequest struct {
 	Price     string `json:"price"`
 	Price2    string `json:"price2"`
 
+	// Optional caller-supplied id; a repeat for the same token within the
+	// dedup window is ignored.
+	IdempotencyID string `json:"idempotency_id,omitempty"`
+
 	// Conditional close definitions (e.g. for TP/SL)
 	CloseOrderType string `json:"close_ordertype"`
 	ClosePrice     string `json:"close_price"`
@@ -95,13 +131,46 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req WebhookRequest
+	r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := req.validate(h.cfg.MaxVolume); err != nil {
+		http.Error(w, "Invalid signal: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	ip := clientIP(r, h.cfg.TrustProxy, h.cfg.TrustedHops)
+
+	// Unknown tokens (not in the in-memory set) consume the strict per-IP
+	// budget and never touch the DB. Known tokens get no per-IP block at all,
+	// so shared TradingView IPs are never blocked. See TokenIndex (final design).
+	if !h.tokens.Has(token) {
+		if ok, wait := h.ipLimit.allow(ip, h.now()); !ok {
+			tooMany(w, wait)
+			return
+		}
+		http.Error(w, "Unknown webhook token", http.StatusUnauthorized)
+		return
+	}
+
+	// Per-token limit runs before the DB lookup: only indexed tokens reach it,
+	// so limiter state stays bounded and a flood never touches the DB.
+	if ok, wait := h.tkLimit.allow(token, h.now()); !ok {
+		tooMany(w, wait)
 		return
 	}
 
 	conn, err := h.db.GetConnectionByWebhookToken(token)
 	if errors.Is(err, sql.ErrNoRows) {
+		// In the set but gone from the DB (deleted/rotated elsewhere): drop it.
+		h.tokens.Remove(token)
 		http.Error(w, "Unknown webhook token", http.StatusUnauthorized)
 		return
 	}
@@ -111,10 +180,18 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	key := dedupKey(token, req)
+	if !h.dedup.firstSeen(key, h.now()) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"duplicate"}`))
+		return
+	}
+
 	// Persist the signal before acknowledging: once TradingView gets a 2xx it
 	// never retries, so an in-memory-only signal would be lost on restart.
 	signalID, err := h.db.SaveSignal(conn.ID, req.Pair, req.Type, req)
 	if err != nil {
+		h.dedup.forget(key)
 		log.Printf("Failed to save signal for connection %d: %v", conn.ID, err)
 		http.Error(w, "Temporary server error, retry later", http.StatusServiceUnavailable)
 		return
@@ -126,9 +203,15 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 		w.Write([]byte(`{"status":"accepted"}`))
 	default:
+		h.dedup.forget(key)
 		log.Printf("Signal queue full, dropping signal for connection %d", conn.ID)
 		http.Error(w, "Server busy, try again", http.StatusServiceUnavailable)
 	}
+}
+
+func tooMany(w http.ResponseWriter, wait time.Duration) {
+	w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+	http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 }
 
 func (h *WebhookHandler) worker() {
@@ -221,7 +304,14 @@ func (h *WebhookHandler) processSignal(conn *database.Connection, req WebhookReq
 		orderInput.Close = closeParams
 	}
 
-	testMode := h.testMode || conn.TestMode
+	// Re-read the connection so a PATCH disabling live between enqueue and
+	// processing is honoured. Fail closed: on lookup error, validate only.
+	testMode := true
+	if fresh, err := h.db.GetConnectionByID(conn.ID); err != nil {
+		log.Printf("Failed to re-read connection %d before order, validating only: %v", conn.ID, err)
+	} else {
+		testMode = !shouldPlaceLive(h.testMode, fresh)
+	}
 	if testMode {
 		orderInput.Validate = true
 	}

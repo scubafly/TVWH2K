@@ -2,7 +2,6 @@ package handler
 
 import (
 	"crypto/rand"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -46,10 +45,15 @@ func newMockDB(t *testing.T) (*database.DB, sqlmock.Sqlmock) {
 
 var connectionCols = []string{
 	"id", "user_id", "exchange", "kraken_api_key_encrypted", "kraken_api_secret_encrypted",
-	"webhook_token", "test_mode", "telegram_bot_token_encrypted", "telegram_chat_id", "created_at",
+	"webhook_token", "test_mode", "live_enabled", "telegram_bot_token_encrypted", "telegram_chat_id", "created_at",
 }
 
 func connectionRow(t *testing.T, enc *security.Encryptor, id int64, token string, testMode bool) *sqlmock.Rows {
+	t.Helper()
+	return connectionRowLive(t, enc, id, token, testMode, false)
+}
+
+func connectionRowLive(t *testing.T, enc *security.Encryptor, id int64, token string, testMode, liveEnabled bool) *sqlmock.Rows {
 	t.Helper()
 	keyEnc, err := enc.Encrypt("api-key")
 	if err != nil {
@@ -60,7 +64,7 @@ func connectionRow(t *testing.T, enc *security.Encryptor, id int64, token string
 		t.Fatal(err)
 	}
 	return sqlmock.NewRows(connectionCols).AddRow(
-		id, "user-1", "kraken", keyEnc, secretEnc, token, testMode, nil, nil, time.Now(),
+		id, "user-1", "kraken", keyEnc, secretEnc, token, testMode, liveEnabled, nil, nil, time.Now(),
 	)
 }
 
@@ -83,6 +87,7 @@ func (f *fakeKraken) AddOrder(order kraken.OrderInput) (*kraken.AddOrderResponse
 func newWebhookHandlerForTest(t *testing.T, db *database.DB, fake *fakeKraken, globalTestMode bool) *WebhookHandler {
 	t.Helper()
 	h := NewWebhookHandler(db, newTestEncryptor(t), globalTestMode)
+	h.tokens.Add("tok")
 	h.newKraken = func(apiKey, apiSecret string) (orderPlacer, error) {
 		return fake, nil
 	}
@@ -103,9 +108,7 @@ const signalBody = `{"text":"BUY Signal","pair":"XBT/USD","type":"buy","ordertyp
 // --- webhook endpoint ---
 
 func TestWebhookUnknownTokenReturns401(t *testing.T) {
-	db, mock := newMockDB(t)
-	mock.ExpectQuery("SELECT (.+) FROM connections WHERE webhook_token").
-		WithArgs("nope").WillReturnError(sql.ErrNoRows)
+	db, _ := newMockDB(t) // no expectations: unknown tokens never reach the DB
 
 	h := newWebhookHandlerForTest(t, db, &fakeKraken{}, true)
 	defer h.Close()
@@ -177,6 +180,7 @@ func TestWebhookProcessesMockSignalInTestMode(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	h := NewWebhookHandler(db, enc, true)
+	h.tokens.Add("tok")
 	// The connection row above was encrypted with a *different* encryptor than
 	// the one inside connectionRow -- use the same enc for both, set here.
 	h.newKraken = func(apiKey, apiSecret string) (orderPlacer, error) {
@@ -208,19 +212,41 @@ func TestWebhookProcessesMockSignalInTestMode(t *testing.T) {
 
 // --- processSignal unit tests ---
 
+func freshConnRow(t *testing.T, enc *security.Encryptor, testMode, live bool) *sqlmock.Rows {
+	t.Helper()
+	k, _ := enc.Encrypt("api-key")
+	sec, _ := enc.Encrypt("api-secret")
+	return sqlmock.NewRows(connectionCols).AddRow(
+		int64(1), "user-1", "kraken", k, sec, "tok", testMode, live, nil, nil, time.Now())
+}
+
 func processSignalWith(t *testing.T, fake *fakeKraken, connTestMode, globalTestMode bool, mockSetup func(sqlmock.Sqlmock)) {
+	t.Helper()
+	processSignalFresh(t, fake, connTestMode, globalTestMode, true, false, mockSetup)
+}
+
+// processSignalFresh: the queued conn says live; freshLive is what the DB
+// returns on re-read (skipFresh=true makes the re-read fail with an error).
+func processSignalFresh(t *testing.T, fake *fakeKraken, connTestMode, globalTestMode, freshLive, failLookup bool, mockSetup func(sqlmock.Sqlmock)) {
+	skipFresh := failLookup
 	t.Helper()
 	db, mock := newMockDB(t)
 	enc := newTestEncryptor(t)
+	if !skipFresh {
+		mock.ExpectQuery("SELECT (.+) FROM connections WHERE id").
+			WithArgs(int64(1)).
+			WillReturnRows(freshConnRow(t, enc, connTestMode, freshLive))
+	}
 	mockSetup(mock)
 
 	h := NewWebhookHandler(db, enc, globalTestMode)
+	h.tokens.Add("tok")
 	h.newKraken = func(apiKey, apiSecret string) (orderPlacer, error) { return fake, nil }
 	defer h.Close()
 
 	keyEnc, _ := enc.Encrypt("api-key")
 	secretEnc, _ := enc.Encrypt("api-secret")
-	conn := &database.Connection{ID: 1, KrakenAPIKeyEncrypted: keyEnc, KrakenAPISecretEncrypted: secretEnc, TestMode: connTestMode}
+	conn := &database.Connection{ID: 1, KrakenAPIKeyEncrypted: keyEnc, KrakenAPISecretEncrypted: secretEnc, TestMode: connTestMode, LiveEnabled: true}
 
 	var req WebhookRequest
 	if err := json.Unmarshal([]byte(signalBody), &req); err != nil {
@@ -274,6 +300,7 @@ func TestProcessSignalPanicDoesNotKillWorker(t *testing.T) {
 	db, _ := newMockDB(t)
 	enc := newTestEncryptor(t)
 	h := NewWebhookHandler(db, enc, true)
+	h.tokens.Add("tok")
 	h.newKraken = func(apiKey, apiSecret string) (orderPlacer, error) {
 		panic("boom")
 	}
@@ -287,5 +314,31 @@ func TestProcessSignalPanicDoesNotKillWorker(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("worker died on panic; Close never returned")
+	}
+}
+
+func TestProcessSignalRevokedLiveFallsBackToValidate(t *testing.T) {
+	fake := &fakeKraken{resp: &kraken.AddOrderResponse{Description: kraken.OrderDescription{Order: "buy"}}}
+	// queued conn has LiveEnabled=true, but DB now says live_enabled=false
+	processSignalFresh(t, fake, false, false, false, false, func(mock sqlmock.Sqlmock) {
+		mock.ExpectExec("INSERT INTO trades").
+			WithArgs(int64(42), int64(1), "XBT/USD", "buy", "limit", "0.001", "95000", "", "validated").
+			WillReturnResult(sqlmock.NewResult(1, 1))
+	})
+	if !fake.gotOrder.Validate {
+		t.Fatal("revoked live_enabled must force validate=true")
+	}
+}
+
+func TestProcessSignalLookupFailureFailsClosed(t *testing.T) {
+	fake := &fakeKraken{resp: &kraken.AddOrderResponse{Description: kraken.OrderDescription{Order: "buy"}}}
+	processSignalFresh(t, fake, false, false, true, true, func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("SELECT (.+) FROM connections WHERE id").WithArgs(int64(1)).WillReturnError(fmt.Errorf("db down"))
+		mock.ExpectExec("INSERT INTO trades").
+			WithArgs(int64(42), int64(1), "XBT/USD", "buy", "limit", "0.001", "95000", "", "validated").
+			WillReturnResult(sqlmock.NewResult(1, 1))
+	})
+	if !fake.gotOrder.Validate {
+		t.Fatal("lookup failure must fail closed (validate)")
 	}
 }

@@ -24,6 +24,8 @@ const (
 	krakenAPIVersionPath = "/0"
 	// krakenPrivatePathPrefix is the complete path prefix for private V0 endpoints.
 	krakenPrivatePathPrefix = krakenAPIVersionPath + "/private/"
+	// krakenPublicPathPrefix is the complete path prefix for public V0 endpoints.
+	krakenPublicPathPrefix = krakenAPIVersionPath + "/public/"
 	// defaultTimeout specifies the default timeout for HTTP requests.
 	defaultTimeout = 20 * time.Second
 )
@@ -34,6 +36,7 @@ type Kraken struct {
 	apiKey     string       // Kraken API Key.
 	apiSecret  string       // Kraken API Secret (Base64 encoded version).
 	httpClient *http.Client // The HTTP client used to make requests.
+	baseURL    string       // API base URL; defaults to krakenAPIBaseURL (overridable for tests).
 }
 
 // NewClient initializes and returns a new Kraken API client.
@@ -56,6 +59,7 @@ func NewClient(apiKey, apiSecret string) (*Kraken, error) {
 	return &Kraken{
 		apiKey:    apiKey,
 		apiSecret: apiSecret,
+		baseURL:   krakenAPIBaseURL,
 		httpClient: &http.Client{
 			Timeout: defaultTimeout, // Gebruik een redelijke timeout.
 		},
@@ -111,7 +115,7 @@ func (k *Kraken) doRequest(method, path string, params url.Values) ([]byte, erro
 	if !strings.HasPrefix(path, krakenPrivatePathPrefix) {
 		return nil, fmt.Errorf("internal logic error: path '%s' does not match private endpoint prefix '%s'", path, krakenPrivatePathPrefix)
 	}
-	fullURL := krakenAPIBaseURL + path
+	fullURL := k.baseURL + path
 
 	// Zorg dat params nooit nil is, voorkomt nil pointer dereference.
 	if params == nil {
@@ -184,4 +188,42 @@ func (k *Kraken) SetHttpClient(client *http.Client) {
 	if client != nil {
 		k.httpClient = client
 	}
+}
+
+// SetBaseURL overrides the API base URL (used by tests with httptest servers).
+func (k *Kraken) SetBaseURL(u string) {
+	if u != "" {
+		k.baseURL = strings.TrimRight(u, "/")
+	}
+}
+
+// doPublicGet performs an unauthenticated GET against a public Kraken endpoint
+// (path must start with /0/public/). No nonce or signature is used.
+func (k *Kraken) doPublicGet(path string, params url.Values) ([]byte, error) {
+	if !strings.HasPrefix(path, krakenPublicPathPrefix) {
+		return nil, fmt.Errorf("internal logic error: path '%s' does not match public endpoint prefix '%s'", path, krakenPublicPathPrefix)
+	}
+	fullURL := k.baseURL + path
+	if len(params) > 0 {
+		fullURL += "?" + params.Encode()
+	}
+	req, err := http.NewRequest("GET", fullURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create new HTTP request for %s: %w", path, err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "YourApp/1.0 (Go Kraken Client)")
+	res, err := k.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request execution failed for %s: %w", path, err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body from %s: %w", path, err)
+	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return body, fmt.Errorf("received non-2xx HTTP status %d from %s: %s", res.StatusCode, path, string(body))
+	}
+	return body, nil
 }
