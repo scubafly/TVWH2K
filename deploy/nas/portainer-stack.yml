@@ -1,0 +1,311 @@
+# TVWH2K self-hosted stack for Portainer (Stacks > Add stack > Web editor).
+# Self-contained: images only, no build:, no bind mounts, no env_file. Caddyfile
+# and SQL are inlined via top-level `configs:` (content:), so no files are
+# needed on the NAS. No ports are published; cloudflared dials out only.
+#
+# ---------------------------------------------------------------------------
+# VARIABLES (Portainer: "Environment variables" below the editor)
+# Required (deploy fails with a message if missing):
+#   POSTGRES_PASSWORD  openssl rand -hex 24     (hex only: used inside a URL)
+#   JWT_SECRET         openssl rand -hex 32     (GoTrue signs, API verifies; same value)
+#   ENCRYPTION_KEY     openssl rand -base64 32  (must be base64 of exactly 32 bytes,
+#                                                see security/crypto.go; LOSING IT
+#                                                makes stored Kraken keys unreadable)
+#   TUNNEL_TOKEN       Cloudflare Zero Trust > Networks > Tunnels > your tunnel
+#   AUTH_HOST          e.g. auth.example.com   (public hostname -> http://caddy:80)
+#   API_HOST           e.g. api.example.com    (public hostname -> http://caddy:80)
+#   SITE_URL           frontend origin, e.g. https://app.example.com (no trailing /)
+# Optional (default after :-):
+#   TB_BASE            /volume1/docker/tradingbridge (bind mounts: postgres, backups,
+#                      caddy-data, caddy-config; create + chown first, see guide)
+#   API_IMAGE          ghcr.io/scubafly/tvwh2k:latest  (or tvwh2k:local, see guide)
+#   POSTGRES_DB        tvwh2k
+#   GOTRUE_DISABLE_SIGNUP  false  -> set to true AFTER you created your account, redeploy
+#   GOTRUE_MAILER_AUTOCONFIRM  true (false needs SMTP_*)
+#   SMTP_HOST (e.g. smtp.gmail.com) SMTP_PORT (587) SMTP_USER SMTP_PASS (Gmail
+#   app password) SMTP_ADMIN_EMAIL SMTP_SENDER_NAME
+#   WEBHOOK_TRUST_PROXY  true
+#   BACKUP_RETENTION_DAYS  14
+# KRAKEN_TEST_MODE is deliberately hard-coded to true below (no live orders).
+#
+# Frontend is NOT part of this stack (stays on its existing hosting); build it
+# with VITE_API_URL=https://$API_HOST VITE_SUPABASE_URL=https://$AUTH_HOST
+# VITE_SUPABASE_ANON_KEY=<HS256 JWT role=anon>. See PORTAINER-GUIDE.md.
+# Literal "$" in inline content is written "$$" (compose interpolation).
+# ---------------------------------------------------------------------------
+name: tvwh2k
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB:-tvwh2k}"
+    volumes:
+      - ${TB_BASE:-/volume1/docker/tradingbridge}/postgres:/var/lib/postgresql/data
+    configs:
+      - source: auth_schema
+        target: /docker-entrypoint-initdb.d/00-auth-schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [internal]
+    restart: unless-stopped
+
+  gotrue:
+    image: supabase/gotrue:v2.188.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: "9999"
+      API_EXTERNAL_URL: "https://${AUTH_HOST:?set AUTH_HOST}"
+      GOTRUE_SITE_URL: "${SITE_URL:?set SITE_URL}"
+      GOTRUE_URI_ALLOW_LIST: "${SITE_URL}"
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_NAMESPACE: auth
+      GOTRUE_DB_DATABASE_URL: "postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tvwh2k}?search_path=auth"
+      DATABASE_URL: "postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tvwh2k}?search_path=auth"
+      GOTRUE_JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET}"
+      GOTRUE_JWT_ALGORITHM: HS256
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: "3600"
+      # false = anyone can sign up. Create your account, then set true and redeploy.
+      GOTRUE_DISABLE_SIGNUP: "${GOTRUE_DISABLE_SIGNUP:-false}"
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "${GOTRUE_MAILER_AUTOCONFIRM:-true}"
+      GOTRUE_SMTP_HOST: "${SMTP_HOST:-}"
+      GOTRUE_SMTP_PORT: "${SMTP_PORT:-587}"
+      GOTRUE_SMTP_USER: "${SMTP_USER:-}"
+      GOTRUE_SMTP_PASS: "${SMTP_PASS:-}"
+      GOTRUE_SMTP_ADMIN_EMAIL: "${SMTP_ADMIN_EMAIL:-}"
+      GOTRUE_SMTP_SENDER_NAME: "${SMTP_SENDER_NAME:-TVWH2K}"
+    networks: [internal]
+    restart: unless-stopped
+
+  # One-shot: waits for GoTrue to create auth.users, then applies the SQL once.
+  migrate:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+      gotrue:
+        condition: service_started
+    environment:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD: "${POSTGRES_PASSWORD}"
+      PGDATABASE: "${POSTGRES_DB:-tvwh2k}"
+    entrypoint: ["bash", "/migrate/run.sh"]
+    configs:
+      - source: migrate_script
+        target: /migrate/run.sh
+      - source: sql_shim
+        target: /migrate/000_auth_uid_shim.sql
+      - source: sql_0001
+        target: /migrate/0001_init.sql
+      - source: sql_0002
+        target: /migrate/0002_live_enabled.sql
+    networks: [internal]
+    restart: "no"
+
+  api:
+    image: "${API_IMAGE:-ghcr.io/scubafly/tvwh2k:latest}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tvwh2k}?sslmode=disable"
+      SUPABASE_JWT_SECRET: "${JWT_SECRET}"
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY:?set ENCRYPTION_KEY}"
+      API_BASE_URL: "https://${API_HOST:?set API_HOST}"
+      FRONTEND_ORIGIN: "${SITE_URL}"
+      KRAKEN_TEST_MODE: "true"
+      WEBHOOK_TRUST_PROXY: "${WEBHOOK_TRUST_PROXY:-true}"
+      PORT: "8081"
+    networks: [internal]
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    depends_on: [gotrue, api]
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      - ${TB_BASE:-/volume1/docker/tradingbridge}/caddy-data:/data
+      - ${TB_BASE:-/volume1/docker/tradingbridge}/caddy-config:/config
+    networks: [internal]
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: "${TUNNEL_TOKEN:?set TUNNEL_TOKEN}"
+    depends_on: [caddy]
+    networks: [internal]
+    restart: unless-stopped
+
+  # Daily pg_dump (custom format) into ${TB_BASE}/backups on the NAS (plain files).
+  backup:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD: "${POSTGRES_PASSWORD}"
+      PGDATABASE: "${POSTGRES_DB:-tvwh2k}"
+      KEEP_DAYS: "${BACKUP_RETENTION_DAYS:-14}"
+    entrypoint: ["bash", "/backup/loop.sh"]
+    configs:
+      - source: backup_script
+        target: /backup/loop.sh
+    volumes:
+      - ${TB_BASE:-/volume1/docker/tradingbridge}/backups:/backups
+    networks: [internal]
+    restart: unless-stopped
+
+networks:
+  internal:
+
+configs:
+  caddyfile:
+    content: |
+      {
+      	auto_https off
+      }
+      # GoTrue serves at root; supabase-js calls <url>/auth/v1/*, so strip it.
+      http://${AUTH_HOST} {
+      	handle_path /auth/v1/* {
+      		reverse_proxy gotrue:9999
+      	}
+      	handle /health {
+      		reverse_proxy gotrue:9999
+      	}
+      	handle {
+      		respond "not found" 404
+      	}
+      }
+      http://${API_HOST} {
+      	reverse_proxy api:8081
+      }
+      http:// {
+      	respond "not found" 404
+      }
+
+  auth_schema:
+    content: |
+      CREATE SCHEMA IF NOT EXISTS auth;
+
+  sql_shim:
+    content: |
+      -- Self-hosted only: auth.uid() for the RLS policies (only if GoTrue did not create it).
+      CREATE SCHEMA IF NOT EXISTS auth;
+      DO $$$$ BEGIN
+        IF to_regprocedure('auth.uid()') IS NULL THEN
+          EXECUTE $$f$$ CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS
+            'SELECT nullif(current_setting(''request.jwt.claim.sub'', true), '''')::uuid' $$f$$;
+        END IF;
+      END $$$$;
+
+  sql_0001:
+    content: |
+      CREATE TABLE IF NOT EXISTS connections (
+          id BIGSERIAL PRIMARY KEY,
+          user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+          exchange TEXT NOT NULL DEFAULT 'kraken',
+          kraken_api_key_encrypted BYTEA NOT NULL,
+          kraken_api_secret_encrypted BYTEA NOT NULL,
+          webhook_token TEXT NOT NULL UNIQUE,
+          test_mode BOOLEAN NOT NULL DEFAULT true,
+          telegram_bot_token_encrypted BYTEA,
+          telegram_chat_id BIGINT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_connections_user_id ON connections(user_id);
+
+      CREATE TABLE IF NOT EXISTS signals (
+          id BIGSERIAL PRIMARY KEY,
+          connection_id BIGINT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+          received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          pair TEXT,
+          type TEXT,
+          payload JSONB
+      );
+      CREATE INDEX IF NOT EXISTS idx_signals_connection_id ON signals(connection_id, received_at DESC);
+
+      CREATE TABLE IF NOT EXISTS trades (
+          id BIGSERIAL PRIMARY KEY,
+          signal_id BIGINT REFERENCES signals(id) ON DELETE SET NULL,
+          connection_id BIGINT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+          pair TEXT,
+          type TEXT,
+          ordertype TEXT,
+          volume TEXT,
+          price TEXT,
+          txid TEXT,
+          status TEXT NOT NULL DEFAULT 'open',
+          pnl NUMERIC NOT NULL DEFAULT 0,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_trades_connection_id ON trades(connection_id, created_at DESC);
+
+      ALTER TABLE connections ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE signals ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE trades ENABLE ROW LEVEL SECURITY;
+
+      CREATE POLICY connections_owner_only ON connections
+          USING (user_id = auth.uid());
+      CREATE POLICY signals_owner_only ON signals
+          USING (connection_id IN (SELECT id FROM connections WHERE user_id = auth.uid()));
+      CREATE POLICY trades_owner_only ON trades
+          USING (connection_id IN (SELECT id FROM connections WHERE user_id = auth.uid()));
+
+      CREATE TABLE IF NOT EXISTS user_profiles (
+          user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+          stripe_customer_id TEXT,
+          subscription_status TEXT NOT NULL DEFAULT 'free',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+  sql_0002:
+    content: |
+      ALTER TABLE connections ADD COLUMN IF NOT EXISTS live_enabled BOOLEAN NOT NULL DEFAULT false;
+
+  migrate_script:
+    content: |
+      set -u
+      # Wait (max ~5 min) for GoTrue to create auth.users.
+      for i in $$(seq 1 150); do
+        if [ "$$(psql -Atc "select to_regclass('auth.users') is not null")" = "t" ]; then break; fi
+        echo "waiting for auth.users ($$i)..."; sleep 2
+      done
+      [ "$$(psql -Atc "select to_regclass('auth.users') is not null")" = "t" ] || { echo "auth.users never appeared"; exit 1; }
+      psql -v ON_ERROR_STOP=1 -qc "CREATE TABLE IF NOT EXISTS public.tb_migrations(name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"
+      for f in 000_auth_uid_shim 0001_init 0002_live_enabled; do
+        if [ "$$(psql -Atc "select 1 from public.tb_migrations where name='$$f'")" = "1" ]; then echo "skip $$f"; continue; fi
+        echo "apply $$f"
+        psql -v ON_ERROR_STOP=1 -1 -f /migrate/$$f.sql -c "INSERT INTO public.tb_migrations(name) VALUES ('$$f')" || exit 1
+      done
+      echo "migrations done"
+
+  backup_script:
+    content: |
+      while true; do
+        out="/backups/$${PGDATABASE}_$$(date +%Y%m%d_%H%M%S).dump"
+        if pg_dump -Fc -f "$$out.partial"; then mv "$$out.partial" "$$out"; echo "backup $$out"; else echo "backup FAILED"; rm -f "$$out.partial"; fi
+        find /backups -name "$${PGDATABASE}_*.dump" -mtime +"$${KEEP_DAYS}" -delete
+        sleep 86400
+      done

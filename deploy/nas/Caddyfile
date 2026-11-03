@@ -1,0 +1,29 @@
+# Plain HTTP on :80 inside the docker network; TLS is terminated by Cloudflare.
+# In the tunnel, point BOTH public hostnames at http://caddy:80.
+{
+	auto_https off
+}
+
+# https://auth.<domain>  -> GoTrue. supabase-js calls <VITE_SUPABASE_URL>/auth/v1/*
+# but GoTrue serves at root, so strip the /auth/v1 prefix.
+http://{$AUTH_HOST} {
+	handle_path /auth/v1/* {
+		reverse_proxy gotrue:9999
+	}
+	handle /health {
+		reverse_proxy gotrue:9999
+	}
+	handle {
+		respond "not found" 404
+	}
+}
+
+# https://api.<domain> -> Go API
+http://{$API_HOST} {
+	reverse_proxy tvwh2k:8081
+}
+
+# Anything else (unknown Host header)
+http:// {
+	respond "not found" 404
+}
