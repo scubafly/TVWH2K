@@ -501,3 +501,18 @@ func TestRunWaitsOneIntervalWithoutState(t *testing.T) {
 		t.Fatalf("orders = %d, want 1 (immediate run with state)", len(f2.orders))
 	}
 }
+
+func TestZeroVolumeSkipped(t *testing.T) {
+	f := btcSource(850) // 50/850 rounds down to 0 with 0 decimals
+	zero := 0
+	old := fakePairs["XXBTZEUR"]
+	p := old
+	p.LotDecimals = &zero
+	fakePairs["XXBTZEUR"] = p
+	defer func() { fakePairs["XXBTZEUR"] = old }()
+	s, _ := newSvc(f, false)
+	s.RunOnce()
+	if len(f.orders) != 0 {
+		t.Fatalf("orders = %+v, want none", f.orders)
+	}
+}

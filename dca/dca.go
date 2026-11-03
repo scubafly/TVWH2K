@@ -102,6 +102,9 @@ type stateFile struct {
 func (s *Service) loadState() error {
 	b, err := os.ReadFile(s.cfg.StateFile)
 	if errors.Is(err, os.ErrNotExist) {
+		if !s.cfg.TestMode {
+			log.Printf("DCA WARNING: state file missing: cooldown and daily spend start empty (%s)", s.cfg.StateFile)
+		}
 		return nil // first start: nothing loaded, Run waits one interval
 	}
 	if err != nil {
@@ -383,12 +386,18 @@ func (s *Service) handle(asset, pair string, balance, price float64, lotDec int,
 		return nil
 	}
 
+	orderVol := roundDown(s.cfg.AmountEUR/price, lotDec)
+	if orderVol <= 0 {
+		log.Printf("DCA: skipping %s, amount %.2f buys zero volume at price %.4f (lot decimals %d)", id, s.cfg.AmountEUR, price, lotDec)
+		return nil
+	}
+
 	order := kraken.OrderInput{
 		UserRef:   userRef(id, s.now()),
 		Pair:      pair,
 		Type:      "buy",
 		OrderType: "market",
-		Volume:    strconv.FormatFloat(roundDown(s.cfg.AmountEUR/price, lotDec), 'f', lotDec, 64),
+		Volume:    strconv.FormatFloat(orderVol, 'f', lotDec, 64),
 		Validate:  s.cfg.TestMode,
 	}
 	resp, err := s.src.PlaceOrder(order)
